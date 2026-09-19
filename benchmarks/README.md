@@ -11,21 +11,23 @@ provenance are not suitable for publication.
 ## Results history
 
 Evolution on the same frozen suite (`atlas-master-v1`, 20 real intent
-queries against a ~7k-symbol codebase). Each full run is an end-to-end
+queries against an ~8k-symbol codebase). Each full run is an end-to-end
 evaluation: query expansion, lexical + dense retrieval, RRF fusion, rerank.
 All runs used the same remote model stack — `qwen3-embedding-8b`
 (4096-d), `qwen3-reranker-8b`, `glm-5.3` for query expansion — so the deltas
 below reflect pipeline changes, not model changes. Result files for runs 1–2
 were superseded and removed; run 3 reproduces their metrics with a
-self-contained candidate pool.
+self-contained candidate pool. "Index warnings" counts partial parses of the
+same two test files surfaced since run 2; run 5's artifact records them
+without query warnings.
 
 | Run | Date | Recall@10 | MRR@10 | p50 | p95 | Index warnings |
 |-----|------|----------:|-------:|----:|----:|----------------|
 | 1 · first full baseline | 2026-09-19 | 0.70 | 0.457 | 8.9 s | 19.9 s | 0 |
 | 2 · correctness hardening — `e32da78` | 2026-09-19 | 0.70 | 0.458 | 9.1 s | 17.3 s | 2 partial-parse surfaced |
-| 3 · observability, traces + pool artifact | 2026-09-19 | 0.70 | 0.458 | 3.7 s | 16.3 s | 0 |
-| 4 · locator rerank documents | 2026-09-19 | 0.80 | 0.593 | 4.0 s | 19.0 s | 0 |
-| 5 · body rerank documents | 2026-09-19 | 0.85 | 0.806 | 6.7 s | 16.8 s | 0 |
+| 3 · observability, traces + pool artifact | 2026-09-19 | 0.70 | 0.458 | 3.7 s | 16.3 s | 2 partial-parse |
+| 4 · locator rerank documents | 2026-09-19 | 0.80 | 0.593 | 4.0 s | 19.0 s | 2 partial-parse |
+| 5 · body rerank documents | 2026-09-19 | 0.85 | 0.806 | 6.7 s | 16.8 s | 2 partial-parse |
 
 ```mermaid
 xychart-beta
@@ -92,9 +94,10 @@ Control A reproduced all 20 ranks of run 3 — the reranker is deterministic,
 so the delta is attributable to the document format. The B control on run
 4's pool reproduced 19 of 20 source ranks with one adjacent-rank boundary
 flip (11→10), which bounds the observed rerank noise. B won on the three
-target cases (49→9, 23→2, 9→2) plus two more, at the cost of one regression
-(9→42, name-attraction: locator headers can promote lexically similar
-symbols over the true owner).
+target cases (49→9, 23→2, 9→2) plus two more, at the cost of one
+out-of-top-10 regression (9→42, name-attraction: locator headers can promote
+lexically similar symbols over the true owner) and two rank-1→2 shifts
+inside the top 10.
 
 The body budget curve on the same pool: 0 chars → 0.85/0.598, 400 →
 0.85/0.689, 1200 → 0.85/0.747, 3000 → **0.90/0.813**, 6000 → 0.90/0.831.

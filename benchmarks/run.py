@@ -13,11 +13,17 @@ from collections import Counter
 from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from priorart.config import Config
 from priorart.expand import EXPAND_PROMPT
-from priorart.indexer import LANGS, parse_source, preflight_parsers, repo_languages
+from priorart.indexer import (
+    LANGS,
+    _capture_file,
+    parse_source,
+    preflight_parsers,
+    repo_languages,
+)
 from priorart.rerank import make_reranker
 from priorart.runtime import Runtime
 from priorart.search import (
@@ -208,6 +214,10 @@ def _run_benchmark(args) -> dict:
     _require_benchmark_args(args)
     save_depth = args.save_depth if args.save_depth is not None else args.candidate_depth
     suite = json.loads(args.suite.read_text())
+    if not suite.get("cases"):
+        raise SystemExit("suite has no cases")
+    if not suite.get("revision"):
+        raise SystemExit("suite has no revision")
     repo = args.repo.resolve()
     _verify_snapshot(repo, suite["revision"])
     failures = preflight_parsers(repo_languages(repo))
@@ -270,7 +280,7 @@ def _run_benchmark(args) -> dict:
     created_at = datetime.now(UTC).isoformat()
     label = args.label or runtime.config.rerank_model
     return {
-        "suite": suite["name"],
+        "suite": suite.get("name") or "unnamed",
         "revision": suite["revision"],
         "created_at": created_at,
         "label": label,
@@ -373,41 +383,66 @@ def _replay_source_cases(source: dict) -> list[dict]:
     return cases_in
 
 
+def _parse_snapshot_file(
+    repo: Path, rel: str
+) -> tuple[list[str], dict[tuple[str, int], int], dict[str, set[int]]]:
+    """Parse one snapshot file into (lines, (qualname, line) -> end_line, qualname -> lines)."""
+    path = PurePosixPath(rel)
+    if not path.parts or path.is_absolute() or ".." in path.parts:
+        raise SystemExit(f"cannot extract body: refusing path outside the snapshot: {rel}")
+    captured = _capture_file(repo, rel)
+    if captured is None:
+        raise SystemExit(f"cannot extract body: unreadable or changed while reading: {rel}")
+    data, _stat = captured
+    lang = LANGS.get(Path(rel).suffix)
+    if lang is None:
+        raise SystemExit(f"cannot extract body: unsupported file {rel}")
+    result = parse_source(data, lang, rel)
+    lines = data.decode("utf-8", "replace").split("\n")
+    spans: dict[tuple[str, int], int] = {}
+    symbol_lines: dict[str, set[int]] = {}
+    for symbol in result.symbols:
+        spans.setdefault((symbol.qualname, symbol.line), symbol.end_line)
+        symbol_lines.setdefault(symbol.qualname, set()).add(symbol.line)
+    return lines, spans, symbol_lines
+
+
 def _attach_bodies(source: dict, repo: Path) -> None:
     """Attach each pool candidate's source span as `body`, parsed from the snapshot."""
-    _verify_snapshot(repo, source["revision"])
-    parsed: dict[str, tuple[list[str], dict[str, tuple[int, int]]]] = {}
+    revision = source.get("revision")
+    if not revision:
+        raise SystemExit("cannot attach bodies: replay source has no revision")
+    _verify_snapshot(repo, revision)
+    parsed: dict[str, tuple[list[str], dict[tuple[str, int], int], dict[str, set[int]]]] = {}
     for case in source["cases"]:
         for candidate in case.get("results") or []:
             if candidate.get("body"):
                 continue
+            line = candidate.get("line")
+            if line is None:
+                raise SystemExit(
+                    f"cannot extract body: {candidate['path']}::{candidate['qualname']} has no "
+                    "line; re-run the benchmark with the current runner first"
+                )
             entry = parsed.get(candidate["path"])
             if entry is None:
-                data = (repo / candidate["path"]).read_bytes()
-                lang = LANGS.get(Path(candidate["path"]).suffix)
-                if lang is None:
-                    raise SystemExit(f"cannot extract body: unsupported file {candidate['path']}")
-                result = parse_source(data, lang, candidate["path"])
-                lines = data.decode("utf-8", "replace").splitlines()
-                spans: dict[str, tuple[int, int]] = {}
-                for symbol in result.symbols:
-                    spans.setdefault(symbol.qualname, (symbol.line, symbol.end_line))
-                entry = (lines, spans)
+                entry = _parse_snapshot_file(repo, candidate["path"])
                 parsed[candidate["path"]] = entry
-            lines, spans = entry
-            span = spans.get(candidate["qualname"])
-            if span is None:
+            lines, spans, symbol_lines = entry
+            end = spans.get((candidate["qualname"], line))
+            if end is None:
+                found = symbol_lines.get(candidate["qualname"])
+                if found:
+                    locations = ", ".join(str(at) for at in sorted(found))
+                    raise SystemExit(
+                        f"snapshot drift: {candidate['path']}::{candidate['qualname']} is not at "
+                        f"line {line} (found at {locations})"
+                    )
                 raise SystemExit(
                     f"cannot extract body: {candidate['path']} has no symbol "
                     f"{candidate['qualname']}"
                 )
-            start, end = span
-            if start != candidate["line"]:
-                raise SystemExit(
-                    f"snapshot drift: {candidate['path']}::{candidate['qualname']} moved "
-                    f"from line {candidate['line']} to {start}"
-                )
-            candidate["body"] = "\n".join(lines[start - 1 : end])
+            candidate["body"] = "\n".join(lines[line - 1 : end])
 
 
 def _require_bodies(cases_in: list[dict]) -> None:
@@ -589,10 +624,11 @@ def _percentile(values: list[float], fraction: float) -> float:
     return values[max(0, math.ceil(len(values) * fraction) - 1)]
 
 
-def _default_output(suite: str, label: str, created_at: str) -> Path:
+def _default_output(suite: str | None, label: str, created_at: str) -> Path:
+    safe_suite = re.sub(r"[^a-zA-Z0-9_.-]+", "-", suite or "replay")
     safe_label = re.sub(r"[^a-zA-Z0-9_.-]+", "-", label)
     timestamp = created_at.replace(":", "").replace("+", "-")
-    return ROOT / ".bench" / "results" / f"{suite}__{safe_label}__{timestamp}.json"
+    return ROOT / ".bench" / "results" / f"{safe_suite}__{safe_label}__{timestamp}.json"
 
 
 if __name__ == "__main__":

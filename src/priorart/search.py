@@ -13,6 +13,10 @@ RRF_K = 60
 RERANK_DOCUMENT_FORMAT = "path-qualname-kind-signature-docstring-body-v1"
 BODY_MAX_CHARS = 3000
 
+# "empty" is a clean parse of a symbol-free file, not a problem; "embed_failed"
+# leaves stale symbols behind and must stay visible.
+_PARSE_ISSUE_STATUSES = frozenset({"partial", "error", "unsupported", "unreadable", "embed_failed"})
+
 
 @dataclass
 class Candidate:
@@ -207,6 +211,8 @@ def _embed_queries(queries: list[str], embed_fn, warnings: list[str]) -> list[by
 
 
 def bounded_body(body: str, max_chars: int = BODY_MAX_CHARS) -> str:
+    if max_chars <= 0:
+        return ""
     if len(body) <= max_chars:
         return body
     kept = body[:max_chars]
@@ -214,9 +220,11 @@ def bounded_body(body: str, max_chars: int = BODY_MAX_CHARS) -> str:
     if cut > 0:
         kept = kept[:cut]
     skipped = len(body.splitlines()) - len(kept.splitlines())
-    if skipped <= 0:
-        return kept
-    return f"{kept}\n… (+{skipped} lines)"
+    if skipped > 0:
+        return f"{kept}\n… (+{skipped} lines)"
+    if len(kept) < len(body):
+        return f"{kept}\n…"
+    return kept
 
 
 def _rerank_document(candidate: Candidate) -> str:
@@ -391,7 +399,7 @@ def _index_line(report: SearchReport) -> str:
     flagged = {
         status: count
         for status, count in (report.parse_coverage or {}).items()
-        if status != "ok" and count
+        if status in _PARSE_ISSUE_STATUSES and count
     }
     if flagged:
         parts.append(

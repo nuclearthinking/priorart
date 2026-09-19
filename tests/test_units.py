@@ -504,3 +504,21 @@ def test_rollback_discards_open_transaction(tmp_path):
         ).fetchall()
         == []
     )
+
+
+def test_index_line_flags_parse_problems_not_clean_empties():
+    from priorart.search import SearchReport, _index_line
+
+    report = SearchReport(
+        candidates=[],
+        warnings=[],
+        symbol_count=5,
+        head=None,
+        age_seconds=None,
+        parse_coverage={"ok": 10, "empty": 3, "partial": 1, "embed_failed": 2},
+    )
+
+    line = _index_line(report)
+
+    assert "parse issues: 2 embed_failed, 1 partial" in line
+    assert "empty" not in line

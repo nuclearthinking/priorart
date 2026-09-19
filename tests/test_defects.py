@@ -119,6 +119,26 @@ def test_rebuild_removes_vanished_files(tmp_path):
     assert _file_rows(conn, repo) == {"kept.py"}
 
 
+def test_embedding_failure_records_embed_failed_parse_state(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def sample(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    conn, stats = _index(
+        repo, tmp_path, embed_fn=lambda texts, *, query=False: (None, "embedding down")
+    )
+
+    assert stats["warnings"] == ["embedding down"]
+    status, detail = conn.execute(
+        "SELECT status, detail FROM parse_state WHERE repo = ? AND path = 'sample.py'",
+        (str(repo),),
+    ).fetchone()
+    assert status == "embed_failed"
+    assert "embedding down" in detail
+    assert "kept previous symbols" in detail
+
+
 def test_embedding_failure_is_retried(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)

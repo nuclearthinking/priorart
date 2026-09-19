@@ -426,15 +426,18 @@ def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int,
     data, st = captured
     lang = LANGS[Path(rel).suffix]
     result = parse_source(data, lang, rel)
-    _record_parse_state(conn, repo, rel, result.status, result.detail)
     if result.status in ("unsupported", "error"):
+        _record_parse_state(conn, repo, rel, result.status, result.detail)
         return 0, f"{rel}: parse {result.status} ({result.detail}); kept previous symbols"
     symbols = result.symbols
     vectors = None
     if symbols and embed_fn is not None:
         vectors, warning = embed_fn([symbol.embed_text for symbol in symbols])
         if vectors is None:
-            return 0, warning or "embedding failed without a warning"
+            detail = warning or "embedding failed without a warning"
+            _record_parse_state(conn, repo, rel, "embed_failed", f"{detail}; kept previous symbols")
+            return 0, detail
+    _record_parse_state(conn, repo, rel, result.status, result.detail)
     ids = [
         row[0]
         for row in conn.execute("SELECT id FROM symbols WHERE repo = ? AND path = ?", (repo, rel))

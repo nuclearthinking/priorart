@@ -258,7 +258,10 @@ def test_bounded_body_truncates_on_line_boundary():
     assert kept.splitlines()[-1] == "line 7"
 
     single_line = benchmark.bounded_body("x" * 500, 60)
-    assert len(single_line) == 60
+    assert single_line == "x" * 60 + "\n…"
+
+    assert benchmark.bounded_body("def f():\n    return 1", 0) == ""
+    assert benchmark.bounded_body("def f():\n    return 1", -5) == ""
 
 
 def test_replay_body_format_matches_search_rerank_document():
@@ -437,6 +440,133 @@ def test_attach_bodies_fails_loudly_on_drift_and_missing_symbols(tmp_path, monke
     absent["cases"][0]["results"][0]["qualname"] = "gone"
     with pytest.raises(SystemExit, match="has no symbol"):
         benchmark._attach_bodies(absent, repo)
+
+
+def _body_source(path: str, qualname: str, line: int) -> dict:
+    return {
+        "suite": "acme-golden",
+        "revision": "abc123",
+        "save_depth": 1,
+        "cases": [
+            {
+                "id": "acme-1",
+                "query": "find the runner",
+                "expected": {"path": path, "qualname": qualname},
+                "results": [
+                    {
+                        "path": path,
+                        "qualname": qualname,
+                        "kind": "function",
+                        "line": line,
+                        "score": 0.5,
+                        "signature": "def x():",
+                        "full_signature": "def x():",
+                        "docstring": "",
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_attach_bodies_refuses_paths_outside_the_snapshot(tmp_path, monkeypatch):
+    benchmark = _benchmark_module()
+    monkeypatch.setattr(benchmark, "_verify_snapshot", lambda repo, revision: None)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    secret = tmp_path / "secret.py"
+    secret.write_text("def leak():\n    pass\n")
+
+    for escape in ("../secret.py", str(secret), "/etc/passwd.py"):
+        with pytest.raises(SystemExit, match="refusing path outside the snapshot"):
+            benchmark._attach_bodies(_body_source(escape, "leak", 1), repo)
+
+
+def test_attach_bodies_matches_duplicate_qualnames_by_line(tmp_path, monkeypatch):
+    benchmark = _benchmark_module()
+    monkeypatch.setattr(benchmark, "_verify_snapshot", lambda repo, revision: None)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.py").write_text("def run():\n    return 1\n\n\ndef run():\n    return 2\n")
+    source = _body_source("a.py", "run", 5)
+
+    benchmark._attach_bodies(source, repo)
+
+    assert source["cases"][0]["results"][0]["body"] == "def run():\n    return 2"
+
+
+def test_attach_bodies_splits_only_on_newlines(tmp_path, monkeypatch):
+    benchmark = _benchmark_module()
+    monkeypatch.setattr(benchmark, "_verify_snapshot", lambda repo, revision: None)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.py").write_bytes(b"def run():\n    a = 1\x0c\n    b = 2\n    c = 3\n")
+    source = _body_source("a.py", "run", 1)
+
+    benchmark._attach_bodies(source, repo)
+
+    assert source["cases"][0]["results"][0]["body"] == (
+        "def run():\n    a = 1\x0c\n    b = 2\n    c = 3"
+    )
+
+
+def test_attach_bodies_requires_revision_and_candidate_lines(tmp_path, monkeypatch):
+    benchmark = _benchmark_module()
+    monkeypatch.setattr(benchmark, "_verify_snapshot", lambda repo, revision: None)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.py").write_text("def run():\n    return 1\n")
+
+    no_revision = _body_source("a.py", "run", 1)
+    no_revision["revision"] = None
+    with pytest.raises(SystemExit, match="has no revision"):
+        benchmark._attach_bodies(no_revision, repo)
+
+    no_line = _body_source("a.py", "run", 1)
+    del no_line["cases"][0]["results"][0]["line"]
+    with pytest.raises(SystemExit, match="has no line"):
+        benchmark._attach_bodies(no_line, repo)
+
+
+def test_default_output_sanitizes_suite_and_label():
+    benchmark = _benchmark_module()
+
+    output = benchmark._default_output(
+        "../../tmp/evil suite", "my experiment", "2026-09-20T10:00:00+00:00"
+    )
+
+    assert output.parent == benchmark.ROOT / ".bench" / "results"
+    assert output.name.startswith("..-..-tmp-evil-suite__my-experiment__")
+    fallback = benchmark._default_output(None, "x", "2026-09-20T10:00:00+00:00")
+    assert fallback.name.startswith("replay__x__")
+
+
+def test_run_benchmark_rejects_degenerate_suites(tmp_path):
+    benchmark = _benchmark_module()
+    base = argparse.Namespace(
+        suite=None,
+        repo=tmp_path,
+        label=None,
+        output=None,
+        k=10,
+        candidate_depth=50,
+        save_depth=None,
+        rebuild=False,
+        rerank_format=None,
+        body_from=None,
+        body_chars=1200,
+        publish=False,
+    )
+
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({"name": "s", "revision": "abc", "cases": []}))
+    with pytest.raises(SystemExit, match="suite has no cases"):
+        benchmark._run_benchmark(argparse.Namespace(**{**vars(base), "suite": empty}))
+
+    no_revision = tmp_path / "norev.json"
+    no_revision.write_text(json.dumps({"name": "s", "cases": [{"id": "x"}]}))
+    with pytest.raises(SystemExit, match="suite has no revision"):
+        benchmark._run_benchmark(argparse.Namespace(**{**vars(base), "suite": no_revision}))
 
 
 def test_replay_artifact_wires_configured_reranker(tmp_path, monkeypatch):
