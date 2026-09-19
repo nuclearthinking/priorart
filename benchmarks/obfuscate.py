@@ -55,10 +55,13 @@ def load_replacements(path: Path) -> dict[str, str]:
     invalid = [
         term
         for term, placeholder in replacements.items()
-        if not isinstance(term, str) or not isinstance(placeholder, str)
+        if not isinstance(term, str)
+        or not isinstance(placeholder, str)
+        or not term
+        or not placeholder
     ]
     if invalid:
-        raise ValueError(f"replacements must map strings to strings, got: {invalid}")
+        raise ValueError(f"replacements must map non-empty strings to strings, got: {invalid}")
     return replacements
 
 
@@ -74,15 +77,19 @@ class Obfuscator:
     """Applies a private term-to-placeholder vocabulary to strings and JSON."""
 
     def __init__(self, replacements: dict[str, str]) -> None:
-        # Adjacent lowercase alphanumerics block a match, so words merely
-        # containing a term stay untouched while hyphenated ids, paths,
-        # UPPER_SNAKE, and CamelCase identifiers are replaced. The boundary
-        # classes are case-sensitive (scoped (?-i:) flags) so an uppercase
-        # letter next to the term still counts as a CamelCase boundary.
+        # A match must end at a word boundary: adjacent lowercase
+        # alphanumerics block it, so words merely containing a term stay
+        # untouched while hyphenated ids, paths, and UPPER_SNAKE identifiers
+        # are replaced. The trailing boundary is case-sensitive (scoped
+        # (?-i:) flag) so an uppercase letter after the term counts as a
+        # CamelCase boundary. The leading side is decided in _replace, where
+        # a lowercase match inside a word is skipped but an uppercase one
+        # (a CamelCase word start like MemoryAcmeChecker) is replaced, and
+        # all-caps words like SYNTAX or ASYNC are left alone.
         boundary = r"(?-i:[a-z0-9])"
         self._patterns = {
             re.compile(
-                rf"(?<!{boundary}){re.escape(term)}(?!{boundary})",
+                rf"{re.escape(term)}(?!{boundary})",
                 re.IGNORECASE,
             ): placeholder
             for term, placeholder in replacements.items()
@@ -90,10 +97,19 @@ class Obfuscator:
 
     def text(self, value: str) -> str:
         for pattern, placeholder in self._patterns.items():
-            value = pattern.sub(
-                lambda match, repl=placeholder: _smart_case(repl, match.group(0)), value
-            )
+            value = pattern.sub(lambda match, repl=placeholder: self._replace(match, repl), value)
         return value
+
+    @staticmethod
+    def _replace(match: re.Match, replacement: str) -> str:
+        matched = match.group(0)
+        preceding = match.string[max(0, match.start() - 1) : match.start()]
+        following = match.string[match.end() : match.end() + 1]
+        if matched.isupper() and following.isupper():
+            return matched
+        if preceding and (preceding.islower() or preceding.isdigit()) and not matched[0].isupper():
+            return matched
+        return _smart_case(replacement, matched)
 
     def value(self, value):
         if isinstance(value, str):

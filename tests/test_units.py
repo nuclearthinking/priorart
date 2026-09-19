@@ -655,3 +655,9 @@ def test_search_pool_expansion_adds_owner_and_can_be_disabled(tmp_path):
     without_expansion = search(conn, "r", "widget", k=10, pool_expansion=False)
     assert [candidate.qualname for candidate in without_expansion.candidates] == ["widget_keeper"]
     assert without_expansion.trace.expansion == []
+
+
+def test_blank_pool_expansion_env_means_default():
+    from priorart.config import Config
+
+    assert Config.model_validate({"pool_expansion": ""}).pool_expansion is True

@@ -68,6 +68,11 @@ class Config(BaseSettings):
     def _blank_means_absent(cls, value):
         return value.strip() or None if isinstance(value, str) else value
 
+    @field_validator("pool_expansion", mode="before")
+    @classmethod
+    def _blank_means_default(cls, value):
+        return True if value == "" else value
+
     @field_validator("db_path", mode="before")
     @classmethod
     def _expand_user(cls, value):

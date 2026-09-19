@@ -37,8 +37,21 @@ class Candidate:
     score: float
 
 
+_COLUMNS = (
+    "id, path, name, qualname, kind, lang, line, end_line, signature, full_signature, "
+    "docstring, body"
+)
+
+
 @dataclass
 class SearchTrace:
+    """Per-stage record of one search.
+
+    ``expansion`` holds the symbol ids that pool expansion appended after
+    the fused top (file-to-owner candidates), not the query-expansion
+    variants listed in ``queries``.
+    """
+
     queries: list[str]
     stage_seconds: dict[str, float]
     fts_rankings: list[list[int]]
@@ -146,25 +159,7 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
         row = rows.get(symbol_id)
         if row is None:
             continue
-        pool.append(
-            (
-                symbol_id,
-                Candidate(
-                    path=row[1],
-                    name=row[2],
-                    qualname=row[3],
-                    kind=row[4],
-                    lang=row[5],
-                    line=row[6],
-                    end_line=row[7],
-                    signature=row[8],
-                    full_signature=row[9],
-                    docstring=row[10],
-                    body=row[11],
-                    score=score,
-                ),
-            )
-        )
+        pool.append((symbol_id, _candidate_from_row(row, score)))
     pool.extend((symbol_id, _candidate_from_row(row, 0.0)) for symbol_id, row in expansion)
     started = time.perf_counter()
     candidates, rerank_indices = _apply_rerank(
@@ -327,7 +322,7 @@ def _file_expansions(  # noqa: PLR0913, PLR0917 - same explicit-collaborator sha
     ]
     if not rows:
         return []
-    embeddings = _embeddings(conn, [row[0] for row in rows])
+    embeddings = _embeddings(conn, [row[0] for row in rows]) if query_vector is not None else {}
     ranked = sorted(
         rows,
         key=lambda row: (
@@ -375,7 +370,9 @@ def _cosine(embedding: bytes | None, query_vector: bytes | None) -> float:
     right.frombytes(query_vector)
     dot = sum(a * b for a, b in zip(left, right, strict=True))
     norm = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
-    return dot / norm if norm else 0.0
+    if not math.isfinite(dot) or not math.isfinite(norm) or norm == 0.0:
+        return 0.0
+    return dot / norm
 
 
 def _apply_rerank(candidates, query, rerank_fn, warnings) -> tuple[list, list[int] | None]:
@@ -567,12 +564,6 @@ def _age(seconds: float) -> str:
 def _repo_meta(conn, repo: str) -> tuple[str | None, float | None]:
     row = conn.execute("SELECT head, indexed_at FROM repos WHERE repo = ?", (repo,)).fetchone()
     return (row[0], row[1]) if row else (None, None)
-
-
-_COLUMNS = (
-    "id, path, name, qualname, kind, lang, line, end_line, signature, full_signature, "
-    "docstring, body"
-)
 
 
 def _fetch(conn, ids: list[int], repo: str) -> dict[int, tuple]:

@@ -231,15 +231,21 @@ def _run_benchmark(args) -> dict:
         details = "; ".join(f"{lang}: {reason}" for lang, reason in failures.items())
         raise SystemExit(f"parser preflight failed: {details}")
 
-    embed_model = os.environ.get("PRIORART_EMBED_MODEL") or "lexical"
-    embed_dim = os.environ.get("PRIORART_EMBED_DIM", "1024")
-    if "PRIORART_DB" not in os.environ:
-        model_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", embed_model)
-        os.environ["PRIORART_DB"] = str(ROOT / ".bench" / f"index-{model_key}-{embed_dim}.db")
+    config = Config()
+    if "PRIORART_DB" not in os.environ and "db_path" not in config.model_fields_set:
+        model_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", config.embed_model or "lexical")
+        os.environ["PRIORART_DB"] = str(
+            ROOT / ".bench" / f"index-{model_key}-{config.embed_dim}.db"
+        )
     if args.no_pool_expansion:
         os.environ["PRIORART_POOL_EXPANSION"] = "false"
 
     runtime = Runtime(repo)
+    # The rerank pool can hold fused plus expansion candidates; rank and
+    # path_rank must cover all of it, or an expansion rescue ranked below
+    # the requested depth would read as a fetch failure.
+    pool_depth = CANDIDATE_LIMIT + EXPANSION_LIMIT
+    depth = max(args.k, args.candidate_depth, pool_depth)
     index_started = time.perf_counter()
     index_stats = runtime.reindex(rebuild=args.rebuild)
     index_seconds = time.perf_counter() - index_started
@@ -249,7 +255,7 @@ def _run_benchmark(args) -> dict:
         started = time.perf_counter()
         report = runtime.search(
             case["query"],
-            k=max(args.k, args.candidate_depth),
+            k=depth,
         )
         latency = time.perf_counter() - started
         results = [
@@ -541,6 +547,12 @@ def _publish(result: dict, output: Path, results_dir: Path, replacements_path: P
     )
     published_result = obfuscator.value(result)
     obfuscate.assert_locator_uniqueness(result, published_result)
+    revision = result.get("revision")
+    if isinstance(revision, str) and revision and published_result.get("revision") == revision:
+        raise ValueError(
+            "suite revision was not replaced by the obfuscation vocabulary; "
+            "add the corpus revision to the private replacements file"
+        )
     published_result["provenance"] = {"redacted": True, "revision": "opaque-alias"}
     published = results_dir / obfuscator.text(output.name)
     published.parent.mkdir(parents=True, exist_ok=True)

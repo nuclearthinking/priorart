@@ -810,3 +810,54 @@ def test_load_replacements_rejects_bad_vocabulary(tmp_path):
         obfuscate.load_replacements(empty)
     with pytest.raises(FileNotFoundError):
         obfuscate.load_replacements(tmp_path / "missing.json")
+
+
+def test_obfuscate_keeps_upper_snake_words_untouched(tmp_path):
+    _, obfuscator = _obfuscator(tmp_path)
+
+    assert obfuscator.text("SYNTAX_ERROR = 1") == "SYNTAX_ERROR = 1"
+    assert obfuscator.text("async def run(): pass") == "async def run(): pass"
+    assert obfuscator.text("ASYNC_TIMEOUT") == "ASYNC_TIMEOUT"
+    assert obfuscator.text("SYNOPSIS") == "SYNOPSIS"
+
+
+def test_obfuscate_still_replaces_camel_case_and_snake_ids(tmp_path):
+    _, obfuscator = _obfuscator(tmp_path)
+
+    assert obfuscator.text("ACME_CONFIG") == "ZETA_CONFIG"
+    assert obfuscator.text("AcmeClient") == "ZetaClient"
+    assert obfuscator.text("MemoryAcmeChecker") == "MemoryZetaChecker"
+
+
+def test_load_replacements_rejects_empty_strings(tmp_path):
+    obfuscate = _obfuscate_module()
+    path = tmp_path / "replacements.json"
+    path.write_text(json.dumps({"acme": ""}))
+
+    with pytest.raises(ValueError, match="non-empty"):
+        obfuscate.load_replacements(path)
+
+
+def test_publish_rejects_unreplaced_revision(tmp_path):
+    benchmark = _benchmark_module()
+    result = {"revision": "610ada2dc9926172c13b5d7dbb1fc99c9709d1b3", "cases": []}
+    replacements = tmp_path / "replacements.json"
+    replacements.write_text(json.dumps({"acme": "zeta"}))
+
+    with pytest.raises(ValueError, match="suite revision was not replaced"):
+        benchmark._publish(result, tmp_path / "orig.json", tmp_path / "out", replacements)
+
+
+def test_publish_accepts_replaced_revision(tmp_path):
+    benchmark = _benchmark_module()
+    result = {"revision": "610ada2dc9926172c13b5d7dbb1fc99c9709d1b3", "cases": []}
+    replacements = tmp_path / "replacements.json"
+    replacements.write_text(
+        json.dumps({"acme": "zeta", "610ada2dc9926172c13b5d7dbb1fc99c9709d1b3": "aaa111"})
+    )
+
+    published = benchmark._publish(result, tmp_path / "orig.json", tmp_path / "out", replacements)
+
+    data = json.loads(published.read_text())
+    assert data["revision"] == "aaa111"
+    assert data["provenance"] == {"redacted": True, "revision": "opaque-alias"}

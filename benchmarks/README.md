@@ -233,6 +233,12 @@ uv run python benchmarks/run.py \
 budget); the manifest records the budget and the snapshot the bodies came
 from.
 
+Artifacts from pool-expansion runs save the top-50 of a rerank pool that
+holds up to 100 candidates (fused top-50 plus expansion). Replays rerank
+the saved 50: exact for document-format experiments, approximate for
+pool-composition ones — a gold that entered the original pool below the
+saved depth will read as `pool_absent`.
+
 ## Tracked obfuscated results
 
 `benchmarks/results/` keeps the shareable result history in the repository.
