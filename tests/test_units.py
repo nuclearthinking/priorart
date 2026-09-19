@@ -73,7 +73,7 @@ def test_post_json_propagates_http_error(monkeypatch):
         httputil.post_json("http://unit.example", {}, None, timeout=1)
 
 
-def test_make_embedder_requiresmake_config():
+def test_make_embedder_requires_config():
     assert embed_mod.make_embedder(make_config(Path("/nonexistent"), embed_base_url=None)) is None
 
 
@@ -146,7 +146,7 @@ def test_embed_wrong_payload_length_returns_warning(monkeypatch):
     assert "wrong payload" in warning
 
 
-def test_make_expander_requiresmake_config():
+def test_make_expander_requires_config():
     assert expand_mod.make_expander(make_config(Path("/nonexistent"), llm_base_url=None)) is None
 
 
