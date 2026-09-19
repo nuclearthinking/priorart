@@ -51,8 +51,6 @@ KIND_BY_TYPE = {
     "enum_item": "enum",
 }
 
-DEF_TYPES = frozenset(KIND_BY_TYPE)
-
 SKIP_DIRS = frozenset(
     {
         ".git",

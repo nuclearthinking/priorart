@@ -8,7 +8,7 @@ MUTATION_WORKERS ?= 8
 
 GATE_DIR := .data/gate
 
-.PHONY: gate clean
+.PHONY: gate dead-code clean
 
 gate:
 	@git rev-parse --verify "$(BASE_REF)^{commit}" >/dev/null 2>&1 || { echo "Unknown BASE_REF: $(BASE_REF)" >&2; exit 2; }
@@ -42,6 +42,11 @@ gate:
 	elif ! grep -q "No gremlins found" "$$log"; then \
 		echo "Mutation report is missing." >&2; exit 1; \
 	fi
+
+# Findings are diagnostic; invalid input and tool failures still fail this target.
+dead-code:
+	@uv run vulture; status=$$?; \
+	if [ "$$status" -ne 0 ] && [ "$$status" -ne 3 ]; then exit "$$status"; fi
 
 clean:
 	@rm -rf $(GATE_DIR) coverage .gremlins_cache .pytest_cache

@@ -24,6 +24,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-gremlins>=1.9.0",
     "ruff>=0.6",
+    "vulture>=2.16",
 ]
 
 [build-system]
@@ -107,3 +108,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "benchmarks/*" = ["INP001", "S603", "S607"]
+
+[tool.vulture]
+paths = ["src/priorart"]
+min_confidence = 60
+sort_by_size = true
