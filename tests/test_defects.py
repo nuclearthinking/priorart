@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -16,6 +15,7 @@ from priorart.search import (
     status_text,
 )
 from priorart.store import connect
+from tests.helpers import git, make_config
 
 SAMPLE = '''\
 def parse_diff_patch(raw: bytes) -> list[str]:
@@ -31,26 +31,10 @@ class DiffViewer:
 '''
 
 
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(  # noqa: S603 - fixed git argv
-        ["git", "-C", str(repo), *args],  # noqa: S607
-        check=True,
-        capture_output=True,
-        env={
-            "PATH": subprocess.os.environ["PATH"],
-            "HOME": str(Path.home()),
-            "GIT_AUTHOR_NAME": "test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-
-
 def _init_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
-    _git(repo, "init", "-q")
+    git(repo, "init", "-q")
     return repo
 
 
@@ -67,13 +51,13 @@ def test_worktree_indexes_only_tracked_files(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "tracked.py").write_text("def tracked(): pass\n")
     (repo / ".gitignore").write_text("ignored.py\n")
-    _git(repo, "add", "tracked.py", ".gitignore")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "tracked.py", ".gitignore")
+    git(repo, "commit", "-q", "-m", "init")
     (repo / "ignored.py").write_text("def ignored(): pass\n")
     (repo / "untracked.py").write_text("def untracked(): pass\n")
 
     worktree = tmp_path / "worktree"
-    _git(repo, "worktree", "add", "-q", str(worktree))
+    git(repo, "worktree", "add", "-q", str(worktree))
 
     conn, _stats = _index(worktree, tmp_path)
     assert _file_rows(conn, worktree) == {"tracked.py"}
@@ -89,8 +73,8 @@ def test_symlink_outside_repo_is_skipped(tmp_path):
     outside = tmp_path / "outside.py"
     outside.write_text("def secret(): '''s3cr3t doc'''\n    pass\n")
     (repo / "linked.py").symlink_to(outside.resolve())
-    _git(repo, "add", "tracked.py", "linked.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "tracked.py", "linked.py")
+    git(repo, "commit", "-q", "-m", "init")
 
     conn, _ = _index(repo, tmp_path)
     assert _file_rows(conn, repo) == {"tracked.py"}
@@ -104,15 +88,15 @@ def test_rebuild_removes_vanished_files(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "kept.py").write_text("def kept(): pass\n")
     (repo / "gone.py").write_text("def gone(): pass\n")
-    _git(repo, "add", "kept.py", "gone.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "kept.py", "gone.py")
+    git(repo, "commit", "-q", "-m", "init")
 
     conn, _ = _index(repo, tmp_path)
     assert _file_rows(conn, repo) == {"kept.py", "gone.py"}
 
     (repo / "gone.py").unlink()
-    _git(repo, "rm", "-q", "gone.py")
-    _git(repo, "commit", "-q", "-m", "remove")
+    git(repo, "rm", "-q", "gone.py")
+    git(repo, "commit", "-q", "-m", "remove")
 
     conn, stats = _index(repo, tmp_path, rebuild=True)
     assert stats["removed"] == 1
@@ -122,8 +106,8 @@ def test_rebuild_removes_vanished_files(tmp_path):
 def test_embedding_failure_records_embed_failed_parse_state(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def sample(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
 
     conn, stats = _index(
         repo, tmp_path, embed_fn=lambda texts, *, query=False: (None, "embedding down")
@@ -142,8 +126,8 @@ def test_embedding_failure_records_embed_failed_parse_state(tmp_path):
 def test_embedding_failure_is_retried(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
 
     calls = {"n": 0}
 
@@ -169,8 +153,8 @@ def test_embedding_failure_is_retried(tmp_path):
 def test_expansion_keeps_raw_query_first(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def exact_unique_symbol(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     report = search(
@@ -188,8 +172,8 @@ def test_fts_search_handles_non_ascii_queries(tmp_path):
     (repo / "retry.py").write_text(
         'def retry_request():\n    """повторить неудачный запрос"""\n    pass\n'
     )
-    _git(repo, "add", "retry.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "retry.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     ids = fts_search(conn, str(repo), "повторить неудачный запрос")
@@ -199,15 +183,15 @@ def test_fts_search_handles_non_ascii_queries(tmp_path):
 def test_status_reports_staleness(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
 
     conn, _ = _index(repo, tmp_path)
     assert "stale: no" in status_text(conn, str(repo), dense=False)
 
     (repo / "sample.py").write_text("def changed(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "edit")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "edit")
 
     text = status_text(conn, str(repo), dense=False)
     assert "HEAD moved since indexing" in text
@@ -218,8 +202,8 @@ def test_status_reports_staleness(tmp_path):
 def test_status_reports_dirty_working_tree(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     (repo / "sample.py").write_text("def edited(): pass\n")
@@ -301,8 +285,8 @@ def test_file_changed_during_embedding_is_reprocessed(tmp_path):
     repo = _init_repo(tmp_path)
     target = repo / "sample.py"
     target.write_text("def original(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
 
     def embed_that_edits_file(texts, *, query=False):
         # the file changes while inference is in flight
@@ -331,8 +315,8 @@ def test_parse_error_keeps_previous_symbols_and_retries(tmp_path, monkeypatch):
 
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def good(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     monkeypatch.setattr(
@@ -357,8 +341,8 @@ def test_unsupported_parser_keeps_previous_symbols(tmp_path, monkeypatch):
 
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def good(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     monkeypatch.setattr(
@@ -379,8 +363,8 @@ def test_partial_parse_indexes_symbols_with_warning(tmp_path, monkeypatch):
 
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def good(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     symbol = parse_source(b"def partial(): pass\n", "python", "sample.py").symbols[0]
@@ -405,8 +389,8 @@ def test_partial_parse_indexes_symbols_with_warning(tmp_path, monkeypatch):
 def test_rerank_incomplete_order_keeps_hybrid_order(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     report = search(
@@ -427,8 +411,8 @@ def test_rerank_incomplete_order_keeps_hybrid_order(tmp_path):
 def test_rerank_duplicate_index_keeps_hybrid_order(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     report = search(
@@ -449,8 +433,8 @@ def test_rerank_duplicate_index_keeps_hybrid_order(tmp_path):
 def test_valid_rerank_reorders_candidates(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     report = search(
@@ -475,10 +459,10 @@ def test_fetch_is_scoped_to_repo(tmp_path):
     repo_b = tmp_path / "repo_b"
     for repo in (repo_a, repo_b):
         repo.mkdir()
-        _git(repo, "init", "-q")
+        git(repo, "init", "-q")
         (repo / "sample.py").write_text("def shared_name(): pass\n")
-        _git(repo, "add", "sample.py")
-        _git(repo, "commit", "-q", "-m", "init")
+        git(repo, "add", "sample.py")
+        git(repo, "commit", "-q", "-m", "init")
 
     conn = connect(tmp_path / "test.db", embed_dim=4)
     index_repo(conn, repo_a)
@@ -495,8 +479,8 @@ def test_symlinked_parent_directory_is_not_indexed(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "pkg").mkdir()
     (repo / "pkg" / "code.py").write_text("def inside(): pass\n")
-    _git(repo, "add", "pkg/code.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "pkg/code.py")
+    git(repo, "commit", "-q", "-m", "init")
 
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -517,8 +501,8 @@ def test_index_repo_crash_does_not_poison_connection(tmp_path, monkeypatch):
 
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def good(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     def exploding_drop(conn, ids):
@@ -540,8 +524,8 @@ def test_index_repo_crash_does_not_poison_connection(tmp_path, monkeypatch):
 def test_embedding_failure_without_warning_is_not_counted(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def good(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
 
     conn, stats = _index(repo, tmp_path, embed_fn=lambda texts, *, query=False: (None, None))
     assert stats["files"] == 0
@@ -551,7 +535,6 @@ def test_embedding_failure_without_warning_is_not_counted(tmp_path):
 
 def test_rerank_ignores_non_dict_and_bad_index_items(monkeypatch, tmp_path):
     from priorart import rerank as rerank_mod
-    from priorart.config import Config
 
     monkeypatch.setattr(
         rerank_mod,
@@ -565,17 +548,10 @@ def test_rerank_ignores_non_dict_and_bad_index_items(monkeypatch, tmp_path):
             ]
         },
     )
-    config = Config(
-        llm_base_url=None,
-        llm_api_key=None,
-        embed_base_url=None,
-        embed_api_key=None,
+    config = make_config(
+        tmp_path,
         rerank_base_url="http://rerank.example/v1",
-        rerank_api_key=None,
-        embed_model="",
-        embed_dim=4,
         rerank_model="reranker",
-        llm_model="",
         db_path=tmp_path / "rerank-test.db",
     )
     rerank = rerank_mod.make_reranker(config)
@@ -595,8 +571,8 @@ def test_valid_rerank_rejects_bool_and_nonfinite_scores():
 def test_search_dense_path_inside_read_transaction(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path, embed_fn=_vector)
     vectorized = conn.execute(
         "SELECT COUNT(*) FROM symbols_vec WHERE repo = ?", (str(repo),)
@@ -614,8 +590,8 @@ def test_partial_parse_state_persists_across_refreshes(tmp_path, monkeypatch):
 
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def good(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     symbol = parse_source(b"def partial(): pass\n", "python", "sample.py").symbols[0]
@@ -649,8 +625,8 @@ def test_parse_error_state_persists_and_retries(tmp_path, monkeypatch):
 
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def good(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     monkeypatch.setattr(
@@ -674,8 +650,8 @@ def test_unreadable_file_state_is_persisted(tmp_path, monkeypatch):
 
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def good(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     monkeypatch.setattr(indexer, "_capture_file", lambda root, rel: None)
@@ -694,8 +670,8 @@ def test_removed_file_cleans_parse_state(tmp_path, monkeypatch):
 
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text("def good(): pass\n")
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     symbol = parse_source(b"def partial(): pass\n", "python", "sample.py").symbols[0]
@@ -710,8 +686,8 @@ def test_removed_file_cleans_parse_state(tmp_path, monkeypatch):
     )
 
     (repo / "sample.py").unlink()
-    _git(repo, "rm", "-q", "sample.py")
-    _git(repo, "commit", "-q", "-m", "remove")
+    git(repo, "rm", "-q", "sample.py")
+    git(repo, "commit", "-q", "-m", "remove")
     index_repo(conn, repo)
 
     assert (
@@ -755,8 +731,8 @@ def test_repo_languages_lists_languages_of_tracked_files(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "code.py").write_text("def f(): pass\n")
     (repo / "tool.go").write_text("package main\n")
-    _git(repo, "add", "code.py", "tool.go")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "code.py", "tool.go")
+    git(repo, "commit", "-q", "-m", "init")
 
     assert indexer.repo_languages(repo) == ["go", "python"]
 
@@ -771,8 +747,8 @@ def _qualname_to_id(conn, repo: Path) -> dict[str, int]:
 def test_search_records_stage_trace(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path, embed_fn=_vector)
 
     report = search(
@@ -809,8 +785,8 @@ def test_search_records_stage_trace(tmp_path):
 def test_search_trace_records_rerank_fallback(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     report = search(

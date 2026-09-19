@@ -4,6 +4,7 @@ import math
 import re
 import time
 from array import array
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -47,8 +48,8 @@ _COLUMNS = (
 class SearchTrace:
     """Per-stage record of one search.
 
-    ``expansion`` holds the symbol ids that pool expansion appended after
-    the fused top (file-to-owner candidates), not the query-expansion
+    ``pool_expansion`` holds the symbol ids that pool expansion appended
+    after the fused top (file-to-owner candidates), not the query-expansion
     variants listed in ``queries``.
     """
 
@@ -58,7 +59,7 @@ class SearchTrace:
     vec_rankings: list[list[int]]
     fused: list[tuple[int, float]]
     rerank_order: list[int] | None
-    expansion: list[int] | None = None
+    pool_expansion: list[int] | None = None
 
 
 @dataclass
@@ -122,11 +123,70 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
     started = time.perf_counter()
     query_vectors = _embed_queries(queries, embed_fn, warnings)
     stage_seconds["embed"] = time.perf_counter() - started
+    started = time.perf_counter()
+    retrieval = _retrieve(conn, repo, query, queries, query_vectors, k, pool_expansion)
+    stage_seconds["retrieve"] = time.perf_counter() - started
+    pool: list[tuple[int, Candidate]] = []
+    for symbol_id, score in retrieval.top:
+        row = retrieval.rows.get(symbol_id)
+        if row is None:
+            continue
+        pool.append((symbol_id, _candidate_from_row(row, score)))
+    pool.extend(
+        (symbol_id, _candidate_from_row(row, 0.0)) for symbol_id, row in retrieval.expansion
+    )
+    started = time.perf_counter()
+    candidates, rerank_indices = _apply_rerank(
+        [candidate for _symbol_id, candidate in pool], query, rerank_fn, warnings
+    )
+    stage_seconds["rerank"] = time.perf_counter() - started
+    rerank_order = (
+        [pool[index][0] for index in rerank_indices] if rerank_indices is not None else None
+    )
+    current_head = _git(Path(repo), "rev-parse", "HEAD")
+    return SearchReport(
+        candidates=candidates[:k],
+        warnings=warnings,
+        symbol_count=retrieval.symbol_count,
+        head=retrieval.head,
+        age_seconds=time.time() - retrieval.indexed_at if retrieval.indexed_at else None,
+        repo=repo,
+        current_head=current_head,
+        trace=SearchTrace(
+            queries=queries,
+            stage_seconds=stage_seconds,
+            fts_rankings=retrieval.fts_rankings,
+            vec_rankings=retrieval.vec_rankings,
+            fused=list(retrieval.top),
+            rerank_order=rerank_order,
+            pool_expansion=[symbol_id for symbol_id, _ in retrieval.expansion],
+        ),
+        parse_coverage=retrieval.parse_coverage,
+    )
+
+
+@dataclass
+class _Retrieval:
+    """Snapshot read for one search, produced inside a single transaction."""
+
+    top: list[tuple[int, float]]
+    rows: dict[int, tuple]
+    expansion: list[tuple[int, tuple]]
+    fts_rankings: list[list[int]]
+    vec_rankings: list[list[int]]
+    head: str | None
+    indexed_at: float | None
+    symbol_count: int
+    parse_coverage: dict[str, int]
+
+
+def _retrieve(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-stage collaborators
+    conn, repo, query, queries, query_vectors, k, pool_expansion
+) -> _Retrieval:
     if conn.in_transaction:
         conn.rollback()
     conn.execute("BEGIN")
     try:
-        started = time.perf_counter()
         fts_rankings = [fts_search(conn, repo, q) for q in queries]
         vec_rankings = [vec_search(conn, repo, vector) for vector in query_vectors]
         scores = rrf([*fts_rankings, *vec_rankings])
@@ -149,44 +209,19 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
                 (repo,),
             ).fetchall()
         )
-        stage_seconds["retrieve"] = time.perf_counter() - started
     except BaseException:
         conn.execute("ROLLBACK")
         raise
     conn.execute("COMMIT")
-    pool: list[tuple[int, Candidate]] = []
-    for symbol_id, score in top:
-        row = rows.get(symbol_id)
-        if row is None:
-            continue
-        pool.append((symbol_id, _candidate_from_row(row, score)))
-    pool.extend((symbol_id, _candidate_from_row(row, 0.0)) for symbol_id, row in expansion)
-    started = time.perf_counter()
-    candidates, rerank_indices = _apply_rerank(
-        [candidate for _symbol_id, candidate in pool], query, rerank_fn, warnings
-    )
-    stage_seconds["rerank"] = time.perf_counter() - started
-    rerank_order = (
-        [pool[index][0] for index in rerank_indices] if rerank_indices is not None else None
-    )
-    current_head = _git(Path(repo), "rev-parse", "HEAD")
-    return SearchReport(
-        candidates=candidates[:k],
-        warnings=warnings,
-        symbol_count=symbol_count,
+    return _Retrieval(
+        top=top,
+        rows=rows,
+        expansion=expansion,
+        fts_rankings=fts_rankings,
+        vec_rankings=vec_rankings,
         head=head,
-        age_seconds=time.time() - indexed_at if indexed_at else None,
-        repo=repo,
-        current_head=current_head,
-        trace=SearchTrace(
-            queries=queries,
-            stage_seconds=stage_seconds,
-            fts_rankings=fts_rankings,
-            vec_rankings=vec_rankings,
-            fused=list(top),
-            rerank_order=rerank_order,
-            expansion=[symbol_id for symbol_id, _ in expansion],
-        ),
+        indexed_at=indexed_at,
+        symbol_count=symbol_count,
         parse_coverage=parse_coverage,
     )
 
@@ -286,12 +321,16 @@ def _expand_pool(conn, repo, query, query_vector, top) -> list[tuple[int, tuple]
     return expanded
 
 
+def _chunks(ids: list, size: int = 500) -> Iterator[list]:
+    for start in range(0, len(ids), size):
+        yield ids[start : start + size]
+
+
 def _file_order(conn, pool) -> list[str]:
     """Files of the pooled symbols, strongest symbol first."""
     paths: dict[int, str] = {}
     symbol_ids = list(pool)
-    for start in range(0, len(symbol_ids), 500):
-        chunk = symbol_ids[start : start + 500]
+    for chunk in _chunks(symbol_ids):
         marks = ",".join("?" * len(chunk))
         paths.update(
             dict(
@@ -568,8 +607,7 @@ def _repo_meta(conn, repo: str) -> tuple[str | None, float | None]:
 
 def _fetch(conn, ids: list[int], repo: str) -> dict[int, tuple]:
     rows = {}
-    for start in range(0, len(ids), 500):
-        chunk = ids[start : start + 500]
+    for chunk in _chunks(ids):
         marks = ",".join("?" * len(chunk))
         for row in conn.execute(
             f"SELECT {_COLUMNS} FROM symbols WHERE id IN ({marks}) AND repo = ?",  # noqa: S608 - marks are placeholders only

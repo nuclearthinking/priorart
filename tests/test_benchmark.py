@@ -55,7 +55,7 @@ def test_benchmark_scores_exact_symbol_identity():
     }
 
 
-def _trace(*, fts=(99,), vec=(99,), fused=(99,), expansion=()):
+def _trace(*, fts=(99,), vec=(99,), fused=(99,), pool_expansion=()):
     from priorart.search import SearchTrace
 
     return SearchTrace(
@@ -65,7 +65,7 @@ def _trace(*, fts=(99,), vec=(99,), fused=(99,), expansion=()):
         vec_rankings=[list(vec)],
         fused=[(symbol_id, 0.01) for symbol_id in fused],
         rerank_order=None,
-        expansion=list(expansion),
+        pool_expansion=list(pool_expansion),
     )
 
 
@@ -96,12 +96,12 @@ def test_loss_stage_counts_pool_expansion_members():
     benchmark = _benchmark_module()
     gold = 42
 
-    rescued = _trace(fts=(7,), vec=(7,), fused=(7,), expansion=(gold,))
+    rescued = _trace(fts=(7,), vec=(7,), fused=(7,), pool_expansion=(gold,))
     assert benchmark.loss_stage(gold, rescued, rank=None, k=10) == "not_fetched"
     assert benchmark.loss_stage(gold, rescued, rank=12, k=10) == "ranked_deep"
     assert benchmark.retrieved_by(gold, rescued) == ["expansion"]
 
-    still_cut = _trace(fts=(gold,), vec=(gold,), fused=(7,), expansion=(5,))
+    still_cut = _trace(fts=(gold,), vec=(gold,), fused=(7,), pool_expansion=(5,))
     assert benchmark.loss_stage(gold, still_cut, rank=None, k=10) == "pool_cutoff"
 
 

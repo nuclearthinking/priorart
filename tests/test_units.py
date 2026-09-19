@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import struct
-import subprocess
 from pathlib import Path
 
 import httpx
@@ -18,51 +17,18 @@ from priorart.cli import app
 from priorart.config import Config
 from priorart.runtime import Runtime
 from priorart.store import connect
+from tests.helpers import git, make_config
 
 SAMPLE = 'def cli_target():\n    """Used by cli and runtime tests."""\n    pass\n'
 
 
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(  # noqa: S603 - fixed git argv
-        ["git", "-C", str(repo), *args],  # noqa: S607
-        check=True,
-        capture_output=True,
-        env={
-            "PATH": subprocess.os.environ["PATH"],
-            "HOME": str(Path.home()),
-            "GIT_AUTHOR_NAME": "test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-
-
 def _init_repo(repo: Path) -> Path:
     repo.mkdir(parents=True, exist_ok=True)
-    _git(repo, "init", "-q")
+    git(repo, "init", "-q")
     (repo / "sample.py").write_text(SAMPLE)
-    _git(repo, "add", "sample.py")
-    _git(repo, "commit", "-q", "-m", "init")
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
     return repo
-
-
-def _config(tmp_path: Path, **overrides) -> Config:
-    fields = {
-        "llm_base_url": None,
-        "llm_api_key": None,
-        "embed_base_url": None,
-        "embed_api_key": None,
-        "rerank_base_url": None,
-        "rerank_api_key": None,
-        "embed_model": "",
-        "embed_dim": 4,
-        "rerank_model": "",
-        "llm_model": "",
-        "db_path": tmp_path / "runtime.db",
-    }
-    fields.update(overrides)
-    return Config(**fields)
 
 
 class _FakeResponse:
@@ -107,12 +73,12 @@ def test_post_json_propagates_http_error(monkeypatch):
         httputil.post_json("http://unit.example", {}, None, timeout=1)
 
 
-def test_make_embedder_requires_config():
-    assert embed_mod.make_embedder(_config(Path("/nonexistent"), embed_base_url=None)) is None
+def test_make_embedder_requiresmake_config():
+    assert embed_mod.make_embedder(make_config(Path("/nonexistent"), embed_base_url=None)) is None
 
 
 def test_embed_serializes_vectors_in_input_order(monkeypatch):
-    config = _config(
+    config = make_config(
         Path("/nonexistent"),
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
@@ -130,7 +96,7 @@ def test_embed_serializes_vectors_in_input_order(monkeypatch):
 
 
 def test_embed_batches_requests(monkeypatch):
-    config = _config(
+    config = make_config(
         Path("/nonexistent"),
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
@@ -151,7 +117,7 @@ def test_embed_batches_requests(monkeypatch):
 
 
 def test_embed_http_failure_returns_warning(monkeypatch):
-    config = _config(
+    config = make_config(
         Path("/nonexistent"),
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
@@ -168,7 +134,7 @@ def test_embed_http_failure_returns_warning(monkeypatch):
 
 
 def test_embed_wrong_payload_length_returns_warning(monkeypatch):
-    config = _config(
+    config = make_config(
         Path("/nonexistent"),
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
@@ -180,12 +146,12 @@ def test_embed_wrong_payload_length_returns_warning(monkeypatch):
     assert "wrong payload" in warning
 
 
-def test_make_expander_requires_config():
-    assert expand_mod.make_expander(_config(Path("/nonexistent"), llm_base_url=None)) is None
+def test_make_expander_requiresmake_config():
+    assert expand_mod.make_expander(make_config(Path("/nonexistent"), llm_base_url=None)) is None
 
 
 def test_expand_parses_chat_response(monkeypatch):
-    config = _config(Path("/nonexistent"), llm_base_url="http://llm.example/v1", llm_model="x")
+    config = make_config(Path("/nonexistent"), llm_base_url="http://llm.example/v1", llm_model="x")
     expand = expand_mod.make_expander(config)
     monkeypatch.setattr(
         expand_mod,
@@ -198,7 +164,7 @@ def test_expand_parses_chat_response(monkeypatch):
 
 
 def test_expand_failure_falls_back_to_raw_query(monkeypatch):
-    config = _config(Path("/nonexistent"), llm_base_url="http://llm.example/v1", llm_model="x")
+    config = make_config(Path("/nonexistent"), llm_base_url="http://llm.example/v1", llm_model="x")
     expand = expand_mod.make_expander(config)
 
     def fake_post_json(*args, **kwargs):
@@ -227,7 +193,7 @@ def test_parse_queries_variants(content, expected):
 
 def test_runtime_search_reindex_status_and_map(tmp_path):
     repo = _init_repo(tmp_path)
-    runtime = Runtime(repo, config=_config(tmp_path))
+    runtime = Runtime(repo, config=make_config(tmp_path))
     stats = runtime.reindex()
     assert stats["symbols"] == 1
     assert stats["files"] == 1
@@ -272,15 +238,15 @@ def test_cli_index_search_status(tmp_path, monkeypatch):
 def test_cli_index_reports_removal_and_warnings(tmp_path, monkeypatch):
     repo = _init_repo(tmp_path / "cli")
     (repo / "extra.py").write_text("def extra(): pass\n")
-    _git(repo, "add", "extra.py")
-    _git(repo, "commit", "-q", "-m", "extra")
+    git(repo, "add", "extra.py")
+    git(repo, "commit", "-q", "-m", "extra")
     monkeypatch.setenv("PRIORART_DB", str(tmp_path / "cli.db"))
     runner = CliRunner()
     runner.invoke(app, ["index", str(repo)])
 
     (repo / "extra.py").unlink()
-    _git(repo, "rm", "-q", "extra.py")
-    _git(repo, "commit", "-q", "-m", "remove")
+    git(repo, "rm", "-q", "extra.py")
+    git(repo, "commit", "-q", "-m", "remove")
     result = runner.invoke(app, ["index", str(repo)])
     assert result.exit_code == 0
     assert "removed 1 deleted files" in result.output
@@ -650,14 +616,13 @@ def test_search_pool_expansion_adds_owner_and_can_be_disabled(tmp_path):
         "widget_keeper",
         "owner",
     ]
-    assert with_expansion.trace.expansion == [ids[("a.py", "owner")]]
+    assert with_expansion.trace.pool_expansion == [ids[("a.py", "owner")]]
 
     without_expansion = search(conn, "r", "widget", k=10, pool_expansion=False)
     assert [candidate.qualname for candidate in without_expansion.candidates] == ["widget_keeper"]
-    assert without_expansion.trace.expansion == []
+    assert without_expansion.trace.pool_expansion == []
 
 
 def test_blank_pool_expansion_env_means_default():
-    from priorart.config import Config
 
     assert Config.model_validate({"pool_expansion": ""}).pool_expansion is True

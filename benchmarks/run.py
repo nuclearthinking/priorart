@@ -105,7 +105,7 @@ def loss_stage(gold_id: int, trace, rank: int | None, k: int) -> str | None:
     if rank is not None and rank <= k:
         return None
     in_pool = gold_id in {symbol_id for symbol_id, _score in trace.fused} or gold_id in (
-        trace.expansion or ()
+        trace.pool_expansion or ()
     )
     if in_pool:
         if rank is None:
@@ -122,7 +122,7 @@ def retrieved_by(gold_id: int, trace) -> list[str]:
         sources.append("fts")
     if any(gold_id in ranking for ranking in trace.vec_rankings):
         sources.append("dense")
-    if gold_id in (trace.expansion or ()):
+    if gold_id in (trace.pool_expansion or ()):
         sources.append("expansion")
     return sources
 
@@ -216,6 +216,48 @@ def _require_benchmark_args(args) -> None:
         raise SystemExit("--body-from requires --replay")
 
 
+def _run_case(  # noqa: PLR0913, PLR0917 - one explicit argument per field of the case record
+    runtime,
+    case,
+    gold_id,
+    depth,
+    k,
+    save_depth,
+) -> dict:
+    started = time.perf_counter()
+    report = runtime.search(case["query"], k=depth)
+    latency = time.perf_counter() - started
+    results = [
+        {
+            "path": candidate.path,
+            "qualname": candidate.qualname,
+            "kind": candidate.kind,
+            "line": candidate.line,
+            "score": candidate.score,
+            "signature": candidate.signature,
+            "full_signature": candidate.full_signature,
+            "docstring": candidate.docstring,
+            "body": candidate.body,
+        }
+        for candidate in report.candidates
+    ]
+    rank = expected_rank(results, case["expected"])
+    trace = report.trace
+    outcome = f"HIT {rank}" if rank is not None and rank <= k else f"OUT {rank or '-'}"
+    print(f"{outcome:>6}  {case['id']}  {latency:.2f}s", flush=True)
+    return {
+        **case,
+        "rank": rank,
+        "path_rank": path_rank(results, case["expected"]),
+        "loss_stage": loss_stage(gold_id, trace, rank, k),
+        "retrieved_by": retrieved_by(gold_id, trace),
+        "latency_seconds": latency,
+        "warnings": report.warnings,
+        "results": results[:save_depth],
+        "trace": asdict(trace),
+    }
+
+
 def _run_benchmark(args) -> dict:
     _require_benchmark_args(args)
     save_depth = args.save_depth if args.save_depth is not None else args.candidate_depth
@@ -250,46 +292,10 @@ def _run_benchmark(args) -> dict:
     index_stats = runtime.reindex(rebuild=args.rebuild)
     index_seconds = time.perf_counter() - index_started
     gold_ids = _verify_expected_symbols(runtime, suite["cases"])
-    cases = []
-    for case in suite["cases"]:
-        started = time.perf_counter()
-        report = runtime.search(
-            case["query"],
-            k=depth,
-        )
-        latency = time.perf_counter() - started
-        results = [
-            {
-                "path": candidate.path,
-                "qualname": candidate.qualname,
-                "kind": candidate.kind,
-                "line": candidate.line,
-                "score": candidate.score,
-                "signature": candidate.signature,
-                "full_signature": candidate.full_signature,
-                "docstring": candidate.docstring,
-                "body": candidate.body,
-            }
-            for candidate in report.candidates
-        ]
-        rank = expected_rank(results, case["expected"])
-        gold_id = gold_ids[case["id"]]
-        trace = report.trace
-        cases.append(
-            {
-                **case,
-                "rank": rank,
-                "path_rank": path_rank(results, case["expected"]),
-                "loss_stage": loss_stage(gold_id, trace, rank, args.k),
-                "retrieved_by": retrieved_by(gold_id, trace),
-                "latency_seconds": latency,
-                "warnings": report.warnings,
-                "results": results[:save_depth],
-                "trace": asdict(trace),
-            }
-        )
-        outcome = f"HIT {rank}" if rank is not None and rank <= args.k else f"OUT {rank or '-'}"
-        print(f"{outcome:>6}  {case['id']}  {latency:.2f}s", flush=True)
+    cases = [
+        _run_case(runtime, case, gold_ids[case["id"]], depth, args.k, save_depth)
+        for case in suite["cases"]
+    ]
 
     created_at = datetime.now(UTC).isoformat()
     label = args.label or runtime.config.rerank_model
