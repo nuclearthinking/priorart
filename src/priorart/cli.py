@@ -6,7 +6,7 @@ from typing import Annotated
 import typer
 
 from .runtime import Runtime
-from .search import format_report, status_text
+from .search import format_report
 
 app = typer.Typer(help="Local agentic code search: find existing symbols before writing new code.")
 
@@ -14,7 +14,7 @@ app = typer.Typer(help="Local agentic code search: find existing symbols before 
 @app.command()
 def index(
     path: Annotated[Path | None, typer.Argument(help="Repository to index.")] = None,
-    rebuild: Annotated[
+    rebuild: Annotated[  # noqa: FBT002
         bool, typer.Option("--rebuild", help="Reindex and re-embed everything.")
     ] = False,
 ) -> None:
@@ -43,7 +43,7 @@ def search(
 @app.command()
 def status(repo: Annotated[Path | None, typer.Option("--repo")] = None) -> None:
     runtime = Runtime(repo or Path.cwd())
-    typer.echo(status_text(runtime.conn, str(runtime.repo), dense=runtime.embed is not None))
+    typer.echo(runtime.status())
 
 
 @app.command()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass, replace
@@ -64,7 +65,7 @@ def vec_search(conn, repo: str, vector, limit: int = 50) -> list[int]:
     return [row[0] for row in rows]
 
 
-def search(
+def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-stage collaborators
     conn,
     repo: str,
     query: str,
@@ -74,29 +75,27 @@ def search(
     rerank_fn=None,
 ) -> SearchReport:
     warnings: list[str] = []
-    queries = [query]
-    if expand_fn is not None:
-        expanded, warning = expand_fn(query)
-        if warning:
-            warnings.append(warning)
-        for extra in expanded or []:
-            if extra and extra not in queries:
-                queries.append(extra)
-    rankings: list[list[int]] = []
-    for q in queries:
-        rankings.append(fts_search(conn, repo, q))
-    if embed_fn is None:
-        warnings.append("dense search skipped: embedding endpoint is not configured")
-    else:
-        for q in queries:
-            vectors, warning = embed_fn([q], query=True)
-            if vectors is None:
-                warnings.append(warning or "dense search failed")
-                continue
-            rankings.append(vec_search(conn, repo, vectors[0]))
-    scores = rrf(rankings)
-    top = sorted(scores.items(), key=lambda item: item[1], reverse=True)[: max(CANDIDATE_LIMIT, k)]
-    rows = _fetch(conn, [symbol_id for symbol_id, _ in top])
+    queries = _expand_queries(query, expand_fn, warnings)
+    query_vectors = _embed_queries(queries, embed_fn, warnings)
+    if conn.in_transaction:
+        conn.rollback()
+    conn.execute("BEGIN")
+    try:
+        rankings = [fts_search(conn, repo, q) for q in queries]
+        rankings.extend(vec_search(conn, repo, vector) for vector in query_vectors)
+        scores = rrf(rankings)
+        top = sorted(scores.items(), key=lambda item: item[1], reverse=True)[
+            : max(CANDIDATE_LIMIT, k)
+        ]
+        rows = _fetch(conn, [symbol_id for symbol_id, _ in top], repo)
+        head, indexed_at = _repo_meta(conn, repo)
+        symbol_count = conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE repo = ?", (repo,)
+        ).fetchone()[0]
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
     candidates = []
     for symbol_id, score in top:
         row = rows.get(symbol_id)
@@ -116,23 +115,7 @@ def search(
                 score=score,
             )
         )
-    if rerank_fn is not None and candidates:
-        documents = [f"{c.signature}\n{c.docstring}" for c in candidates]
-        order, warning = rerank_fn(query, documents)
-        if warning:
-            warnings.append(warning)
-        if order:
-            positions = dict(order)
-            ordered = sorted(positions, key=lambda idx: positions[idx], reverse=True)
-            candidates = [
-                replace(candidates[idx], score=positions[idx])
-                for idx in ordered
-                if 0 <= idx < len(candidates)
-            ]
-    head, indexed_at = _repo_meta(conn, repo)
-    symbol_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE repo = ?", (repo,)).fetchone()[
-        0
-    ]
+    candidates = _apply_rerank(candidates, query, rerank_fn, warnings)
     current_head = _git(Path(repo), "rev-parse", "HEAD")
     return SearchReport(
         candidates=candidates[:k],
@@ -143,6 +126,73 @@ def search(
         repo=repo,
         current_head=current_head,
     )
+
+
+def _expand_queries(query: str, expand_fn, warnings: list[str]) -> list[str]:
+    queries = [query]
+    if expand_fn is None:
+        return queries
+    expanded, warning = expand_fn(query)
+    if warning:
+        warnings.append(warning)
+    for extra in expanded or []:
+        if extra and extra not in queries:
+            queries.append(extra)
+    return queries
+
+
+def _embed_queries(queries: list[str], embed_fn, warnings: list[str]) -> list[bytes]:
+    if embed_fn is None:
+        warnings.append("dense search skipped: embedding endpoint is not configured")
+        return []
+    vectors = []
+    for query in queries:
+        result, warning = embed_fn([query], query=True)
+        if result is None:
+            warnings.append(warning or "dense search failed")
+            continue
+        vectors.append(result[0])
+    return vectors
+
+
+def _apply_rerank(candidates, query, rerank_fn, warnings) -> list:
+    if rerank_fn is None or not candidates:
+        return candidates
+    documents = [f"{c.signature}\n{c.docstring}" for c in candidates]
+    order, warning = rerank_fn(query, documents)
+    if warning:
+        warnings.append(warning)
+    if _valid_rerank(order, len(documents)):
+        positions = dict(order)
+        ordered = sorted(positions, key=lambda idx: positions[idx], reverse=True)
+        return [replace(candidates[idx], score=positions[idx]) for idx in ordered]
+    if order:
+        warnings.append(
+            f"rerank order invalid or incomplete ({len(order)}/{len(documents)} "
+            "candidates); kept hybrid order"
+        )
+    return candidates
+
+
+def _valid_rerank(order, n: int) -> bool:
+    if not isinstance(order, list) or len(order) != n:
+        return False
+    seen: set[int] = set()
+    return all(_valid_rerank_item(item, n, seen) for item in order)
+
+
+def _valid_rerank_item(item, n: int, seen: set[int]) -> bool:
+    if not isinstance(item, tuple) or len(item) != 2:
+        return False
+    idx, score = item
+    if not isinstance(idx, int) or isinstance(idx, bool):
+        return False
+    if not 0 <= idx < n or idx in seen:
+        return False
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return False
+    seen.add(idx)
+    return math.isfinite(score)
 
 
 def format_report(report: SearchReport) -> str:
@@ -167,7 +217,7 @@ def format_report(report: SearchReport) -> str:
     return "\n".join(lines)
 
 
-def status_text(conn, repo: str, dense: bool = True) -> str:
+def status_text(conn, repo: str, *, dense: bool = True) -> str:
     root = Path(repo)
     head, indexed_at = _repo_meta(conn, repo)
     symbol_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE repo = ?", (repo,)).fetchone()[
@@ -228,14 +278,14 @@ def map_symbols_text(conn, repo: str, path_glob: str, limit: int = 200) -> str:
 def _file_drift(conn, repo: str, root: Path) -> tuple[int, int]:
     expected = set(_list_files(root))
     known = {
-        path: (mtime, size)
-        for path, mtime, size in conn.execute(
-            "SELECT path, mtime, size FROM files WHERE repo = ?", (repo,)
+        path: (mtime_ns, size)
+        for path, mtime_ns, size in conn.execute(
+            "SELECT path, mtime_ns, size FROM files WHERE repo = ?", (repo,)
         )
     }
     gone = sum(1 for path in known if path not in expected)
     changed = len(expected - set(known))
-    for path, (mtime, size) in known.items():
+    for path, (mtime_ns, size) in known.items():
         if path not in expected:
             continue
         try:
@@ -243,7 +293,7 @@ def _file_drift(conn, repo: str, root: Path) -> tuple[int, int]:
         except OSError:
             changed += 1
             continue
-        if (st.st_mtime, st.st_size) != (mtime, size):
+        if (st.st_mtime_ns, st.st_size) != (mtime_ns, size):
             changed += 1
     return gone, changed
 
@@ -279,11 +329,14 @@ def _repo_meta(conn, repo: str) -> tuple[str | None, float | None]:
 _COLUMNS = "id, path, name, qualname, kind, lang, line, end_line, signature, docstring"
 
 
-def _fetch(conn, ids: list[int]) -> dict[int, tuple]:
+def _fetch(conn, ids: list[int], repo: str) -> dict[int, tuple]:
     rows = {}
     for start in range(0, len(ids), 500):
         chunk = ids[start : start + 500]
         marks = ",".join("?" * len(chunk))
-        for row in conn.execute(f"SELECT {_COLUMNS} FROM symbols WHERE id IN ({marks})", chunk):
+        for row in conn.execute(
+            f"SELECT {_COLUMNS} FROM symbols WHERE id IN ({marks}) AND repo = ?",  # noqa: S608 - marks are placeholders only
+            (*chunk, repo),
+        ):
             rows[row[0]] = row
     return rows

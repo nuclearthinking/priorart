@@ -108,6 +108,16 @@ class Symbol:
     embed_text: str
 
 
+@dataclass
+class ParseResult:
+    symbols: list[Symbol]
+    # ok: parsed cleanly; partial: syntax errors but symbols extracted;
+    # empty: parsed cleanly, no symbols; unsupported: no parser;
+    # error: syntax errors and no symbols, or parser raised.
+    status: str
+    detail: str | None = None
+
+
 _parsers: dict[str, object] = {}
 
 
@@ -120,14 +130,23 @@ def _parser(lang: str):
     return _parsers[lang]
 
 
-def parse_source(data: bytes, lang: str, rel_path: str) -> list[Symbol]:
+def parse_source(data: bytes, lang: str, rel_path: str) -> ParseResult:
     parser = _parser(lang)
     if parser is None:
-        return []
-    tree = parser.parse(data)
+        return ParseResult([], "unsupported", f"no parser available for language {lang!r}")
+    try:
+        tree = parser.parse(data)
+    except Exception as err:  # noqa: BLE001 - tree-sitter raises varied errors
+        return ParseResult([], "error", f"parser raised {type(err).__name__}: {err}")
     out: list[Symbol] = []
     _walk(tree.root_node, data, [], out, lang, rel_path)
-    return out
+    if tree.root_node.has_error:
+        if out:
+            return ParseResult(out, "partial", "source contains syntax errors")
+        return ParseResult([], "error", "source contains syntax errors")
+    if not out:
+        return ParseResult([], "empty", None)
+    return ParseResult(out, "ok", None)
 
 
 def _node_text(node, data: bytes) -> str:
@@ -148,7 +167,9 @@ def _kind(node) -> str | None:
     return None
 
 
-def _walk(node, data: bytes, parents, out: list[Symbol], lang: str, rel_path: str) -> None:
+def _walk(  # noqa: PLR0913, PLR0917 - recursive tree walk context
+    node, data: bytes, parents, out: list[Symbol], lang: str, rel_path: str
+) -> None:
     next_parents = parents
     kind = _kind(node)
     if kind is not None:
@@ -232,8 +253,11 @@ def _docstring(node, data: bytes, lang: str) -> str:
 
 
 def _git(root: Path, *args: str) -> str | None:
-    proc = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, text=True, check=False
+    proc = subprocess.run(  # noqa: S603 - fixed git argv
+        ["git", "-C", str(root), *args],  # noqa: S607 - partial path is fine
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if proc.returncode != 0:
         return None
@@ -241,8 +265,8 @@ def _git(root: Path, *args: str) -> str | None:
 
 
 def _list_files(root: Path) -> list[str]:
-    proc = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z"],
+    proc = subprocess.run(  # noqa: S603 - fixed git argv
+        ["git", "-C", str(root), "ls-files", "-z"],  # noqa: S607 - partial path is fine
         capture_output=True,
         text=True,
         check=False,
@@ -269,63 +293,111 @@ def _list_files(root: Path) -> list[str]:
     return out
 
 
-def index_repo(conn, root: Path, embed_fn=None, rebuild: bool = False) -> dict:
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_beneath(root: Path, rel: str) -> int:
+    """Open rel strictly beneath root, refusing symlinked path components."""
+    parts = [part for part in rel.split("/") if part not in ("", ".")]
+    if not parts or ".." in parts:
+        raise FileNotFoundError(rel)
+    dir_fd = os.open(root, os.O_RDONLY)
+    opened: int | None = None
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | _NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        opened = os.open(parts[-1], os.O_RDONLY | _NOFOLLOW, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    return opened
+
+
+def _capture_file(root: Path, rel: str) -> tuple[bytes, os.stat_result] | None:
+    """Read file bytes and its stat together, from the same open file description."""
+    try:
+        fd = _open_beneath(root, rel)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            before = os.fstat(fh.fileno())
+            data = fh.read()
+            after = os.fstat(fh.fileno())
+    except OSError:
+        return None
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        return None
+    if len(data) != before.st_size:
+        return None
+    return data, before
+
+
+def index_repo(conn, root: Path, embed_fn=None, *, rebuild: bool = False) -> dict:
     root = Path(root).resolve()
     repo = str(root)
     head = _git(root, "rev-parse", "HEAD")
     rels = _list_files(root)
     current = set(rels)
     known = {
-        path: (mtime, size)
-        for path, mtime, size in conn.execute(
-            "SELECT path, mtime, size FROM files WHERE repo = ?", (repo,)
+        path: (mtime_ns, size)
+        for path, mtime_ns, size in conn.execute(
+            "SELECT path, mtime_ns, size FROM files WHERE repo = ?", (repo,)
         )
     }
     removed = 0
-    for rel in known:
-        if rel not in current:
-            _drop_file(conn, repo, rel)
-            removed += 1
     warnings: list[str] = []
     symbols = 0
     files = 0
-    for rel in rels:
-        full = root / rel
-        try:
-            st = full.stat()
-        except OSError:
-            continue
-        if not rebuild and known.get(rel) == (st.st_mtime, st.st_size):
-            continue
-        count, warning = _reindex_file(conn, repo, root, rel, embed_fn)
-        if warning is not None:
-            warnings.append(warning)
-            continue
-        symbols += count
-        files += 1
-    conn.execute(
-        "INSERT INTO repos (repo, head, indexed_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(repo) DO UPDATE SET head = excluded.head, indexed_at = excluded.indexed_at",
-        (repo, head, time.time()),
-    )
+    try:
+        for rel in known:
+            if rel not in current:
+                _drop_file(conn, repo, rel)
+                removed += 1
+        for rel in rels:
+            full = root / rel
+            try:
+                st = full.stat()
+            except OSError:
+                continue
+            if not rebuild and known.get(rel) == (st.st_mtime_ns, st.st_size):
+                continue
+            count, warning = _reindex_file(conn, repo, root, rel, embed_fn)
+            if warning is not None:
+                warnings.append(warning)
+                if count == 0:
+                    continue
+            symbols += count
+            files += 1
+        conn.execute(
+            "INSERT INTO repos (repo, head, indexed_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(repo) DO UPDATE SET head = excluded.head, "
+            "indexed_at = excluded.indexed_at",
+            (repo, head, time.time()),
+        )
+    except BaseException:
+        conn.rollback()
+        raise
     conn.commit()
     return {"files": files, "symbols": symbols, "removed": removed, "warnings": warnings}
 
 
 def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int, str | None]:
-    full = root / rel
-    lang = LANGS[full.suffix]
-    try:
-        data = full.read_bytes()
-    except OSError:
-        _drop_file(conn, repo, rel)
-        return 0, None
-    symbols = parse_source(data, lang, rel)
+    captured = _capture_file(root, rel)
+    if captured is None:
+        return 0, f"{rel}: unreadable or changed while reading; not indexed, will retry"
+    data, st = captured
+    lang = LANGS[Path(rel).suffix]
+    result = parse_source(data, lang, rel)
+    if result.status in ("unsupported", "error"):
+        return 0, f"{rel}: parse {result.status} ({result.detail}); kept previous symbols"
+    symbols = result.symbols
     vectors = None
     if symbols and embed_fn is not None:
         vectors, warning = embed_fn([symbol.embed_text for symbol in symbols])
         if vectors is None:
-            return 0, warning
+            return 0, warning or "embedding failed without a warning"
     ids = [
         row[0]
         for row in conn.execute("SELECT id FROM symbols WHERE repo = ? AND path = ?", (repo, rel))
@@ -358,18 +430,24 @@ def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int,
                 (cur.lastrowid, repo, vectors[count]),
             )
         count += 1
-    try:
-        st = full.stat()
-    except OSError:
-        conn.commit()
-        return count, None
     conn.execute(
-        "INSERT INTO files (repo, path, mtime, size) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(repo, path) DO UPDATE SET mtime = excluded.mtime, size = excluded.size",
-        (repo, rel, st.st_mtime, st.st_size),
+        "INSERT INTO files (repo, path, mtime_ns, size) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(repo, path) DO UPDATE SET mtime_ns = excluded.mtime_ns, "
+        "size = excluded.size",
+        (repo, rel, st.st_mtime_ns, st.st_size),
     )
     conn.commit()
-    return count, None
+    warning = None
+    if result.status == "partial":
+        warning = f"{rel}: partial parse, {len(symbols)} symbols extracted from source with errors"
+    try:
+        now = (root / rel).stat()
+    except OSError:
+        return count, warning
+    if (now.st_mtime_ns, now.st_size) != (st.st_mtime_ns, st.st_size):
+        changed = f"{rel}: changed during indexing; result may be stale until next refresh"
+        warning = f"{warning}; {changed}" if warning else changed
+    return count, warning
 
 
 def _drop_file(conn, repo: str, rel: str) -> None:
@@ -386,5 +464,5 @@ def _drop_symbols(conn, ids: list[int]) -> None:
     if not ids:
         return
     marks = ",".join("?" * len(ids))
-    conn.execute(f"DELETE FROM symbols_vec WHERE symbol_id IN ({marks})", ids)
-    conn.execute(f"DELETE FROM symbols WHERE id IN ({marks})", ids)
+    conn.execute(f"DELETE FROM symbols_vec WHERE symbol_id IN ({marks})", ids)  # noqa: S608 - marks are placeholders only
+    conn.execute(f"DELETE FROM symbols WHERE id IN ({marks})", ids)  # noqa: S608 - marks are placeholders only

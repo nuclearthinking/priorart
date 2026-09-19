@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS repos (
 CREATE TABLE IF NOT EXISTS files (
     repo TEXT NOT NULL,
     path TEXT NOT NULL,
-    mtime REAL NOT NULL,
+    mtime_ns INTEGER NOT NULL,
     size INTEGER NOT NULL,
     PRIMARY KEY (repo, path)
 );
@@ -61,10 +61,11 @@ def connect(db_path: Path, embed_dim: int) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.enable_load_extension(True)
+    conn.enable_load_extension(True)  # noqa: FBT003 - sqlite3 positional-only API
     sqlite_vec.load(conn)
-    conn.enable_load_extension(False)
+    conn.enable_load_extension(False)  # noqa: FBT003 - sqlite3 positional-only API
     try:
+        _drop_legacy_files_table(conn)
         conn.executescript(SCHEMA)
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'symbols_vec'"
@@ -80,3 +81,9 @@ def connect(db_path: Path, embed_dim: int) -> sqlite3.Connection:
     except sqlite3.OperationalError as err:
         raise RuntimeError(f"failed to initialize priorart database at {db_path}: {err}") from err
     return conn
+
+
+def _drop_legacy_files_table(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+    if columns and "mtime_ns" not in columns:
+        conn.execute("DROP TABLE files")

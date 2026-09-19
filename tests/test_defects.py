@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
-from priorart.indexer import index_repo, parse_source
-from priorart.search import fts_search, search, status_text
+import pytest
+
+from priorart.indexer import ParseResult, index_repo, parse_source
+from priorart.search import _fetch, _valid_rerank, fts_search, search, status_text
 from priorart.store import connect
 
 SAMPLE = '''\
@@ -22,8 +25,8 @@ class DiffViewer:
 
 
 def _git(repo: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", "-C", str(repo), *args],
+    subprocess.run(  # noqa: S603 - fixed git argv
+        ["git", "-C", str(repo), *args],  # noqa: S607
         check=True,
         capture_output=True,
         env={
@@ -44,7 +47,7 @@ def _init_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _index(repo: Path, tmp_path: Path, embed_fn=None, rebuild=False):
+def _index(repo: Path, tmp_path: Path, embed_fn=None, *, rebuild=False):
     conn = connect(tmp_path / "test.db", embed_dim=4)
     return conn, index_repo(conn, repo, embed_fn=embed_fn, rebuild=rebuild)
 
@@ -213,7 +216,7 @@ class Widget:
     def size(self):
         return 0
 '''
-    symbols = {s.qualname: s for s in parse_source(source.encode(), "python", "w.py")}
+    symbols = {s.qualname: s for s in parse_source(source.encode(), "python", "w.py").symbols}
     assert "Real docstring" in symbols["process"].docstring
     assert "not a docstring" not in symbols["process"].docstring
     assert symbols["Widget"].docstring == ""
@@ -257,7 +260,323 @@ def test_language_coverage():
         ),
     ]
     for lang, source, expected in cases:
-        symbols = parse_source(source.encode(), lang, f"sample.{lang}")
+        symbols = parse_source(source.encode(), lang, f"sample.{lang}").symbols
         actual = [(s.qualname, s.kind) for s in symbols]
         for pair in expected:
             assert pair in actual, f"{lang}: {pair} missing from {actual}"
+
+
+def _vector(texts, *, query=False):
+    return [b"\x00\x00\x80?" * 4] * len(texts), None
+
+
+def test_file_changed_during_embedding_is_reprocessed(tmp_path):
+    repo = _init_repo(tmp_path)
+    target = repo / "sample.py"
+    target.write_text("def original(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    def embed_that_edits_file(texts, *, query=False):
+        # the file changes while inference is in flight
+        target.write_text("def replacement(): pass\n")
+        return [b"\x00\x00\x80?" * 4] * len(texts), None
+
+    conn, stats = _index(repo, tmp_path, embed_fn=embed_that_edits_file)
+    assert any("changed during indexing" in warning for warning in stats["warnings"])
+    names = {
+        row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(repo),))
+    }
+    assert names == {"original"}
+
+    # the captured stat (not the late one) was recorded, so the next
+    # refresh must notice the change and reindex the file
+    stats = index_repo(conn, repo, embed_fn=_vector)
+    assert stats["warnings"] == []
+    names = {
+        row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(repo),))
+    }
+    assert names == {"replacement"}
+
+
+def test_parse_error_keeps_previous_symbols_and_retries(tmp_path, monkeypatch):
+    from priorart import indexer
+
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def good(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    monkeypatch.setattr(
+        indexer, "parse_source", lambda data, lang, rel: ParseResult([], "error", "boom")
+    )
+    (repo / "sample.py").write_text("def changed(): pass\n")
+
+    stats = index_repo(conn, repo)
+    assert stats["warnings"] == ["sample.py: parse error (boom); kept previous symbols"]
+    names = {
+        row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(repo),))
+    }
+    assert names == {"good"}
+
+    # the file is not marked indexed: every refresh retries it
+    stats = index_repo(conn, repo)
+    assert stats["warnings"] == ["sample.py: parse error (boom); kept previous symbols"]
+
+
+def test_unsupported_parser_keeps_previous_symbols(tmp_path, monkeypatch):
+    from priorart import indexer
+
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def good(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    monkeypatch.setattr(
+        indexer, "parse_source", lambda data, lang, rel: ParseResult([], "unsupported", "gone")
+    )
+    (repo / "sample.py").write_text("def other(): pass\n")
+
+    stats = index_repo(conn, repo)
+    assert stats["warnings"] == ["sample.py: parse unsupported (gone); kept previous symbols"]
+    names = {
+        row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(repo),))
+    }
+    assert names == {"good"}
+
+
+def test_partial_parse_indexes_symbols_with_warning(tmp_path, monkeypatch):
+    from priorart import indexer
+
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def good(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    symbol = parse_source(b"def partial(): pass\n", "python", "sample.py").symbols[0]
+    monkeypatch.setattr(
+        indexer, "parse_source", lambda data, lang, rel: ParseResult([symbol], "partial", "syntax")
+    )
+    (repo / "sample.py").write_text("def changed(): pass\n")
+
+    stats = index_repo(conn, repo)
+    assert any("partial parse" in warning for warning in stats["warnings"])
+    names = {
+        row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(repo),))
+    }
+    assert names == {"partial"}
+
+    # partial results are published and the file is marked indexed: no retry
+    stats = index_repo(conn, repo)
+    assert stats["warnings"] == []
+    assert stats["files"] == 0
+
+
+def test_rerank_incomplete_order_keeps_hybrid_order(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text(SAMPLE)
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    report = search(
+        conn,
+        str(repo),
+        "sample.py",
+        k=3,
+        rerank_fn=lambda query, documents: ([(0, 9.0)], None),
+    )
+    assert [c.qualname for c in report.candidates] == [
+        "DiffViewer",
+        "DiffViewer.render",
+        "parse_diff_patch",
+    ]
+    assert any("invalid or incomplete (1/3" in warning for warning in report.warnings)
+
+
+def test_rerank_duplicate_index_keeps_hybrid_order(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text(SAMPLE)
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    report = search(
+        conn,
+        str(repo),
+        "sample.py",
+        k=3,
+        rerank_fn=lambda query, documents: ([(0, 5.0), (0, 6.0), (1, 1.0)], None),
+    )
+    assert [c.qualname for c in report.candidates] == [
+        "DiffViewer",
+        "DiffViewer.render",
+        "parse_diff_patch",
+    ]
+    assert any("invalid or incomplete" in warning for warning in report.warnings)
+
+
+def test_valid_rerank_reorders_candidates(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text(SAMPLE)
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    report = search(
+        conn,
+        str(repo),
+        "sample.py",
+        k=3,
+        rerank_fn=lambda query, documents: (
+            [(1, 0.9), (0, 0.5), (2, 0.1)],
+            None,
+        ),
+    )
+    assert [c.qualname for c in report.candidates] == [
+        "DiffViewer.render",
+        "DiffViewer",
+        "parse_diff_patch",
+    ]
+
+
+def test_fetch_is_scoped_to_repo(tmp_path):
+    repo_a = tmp_path / "repo_a"
+    repo_b = tmp_path / "repo_b"
+    for repo in (repo_a, repo_b):
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        (repo / "sample.py").write_text("def shared_name(): pass\n")
+        _git(repo, "add", "sample.py")
+        _git(repo, "commit", "-q", "-m", "init")
+
+    conn = connect(tmp_path / "test.db", embed_dim=4)
+    index_repo(conn, repo_a)
+    index_repo(conn, repo_b)
+    ids_b = [
+        row[0] for row in conn.execute("SELECT id FROM symbols WHERE repo = ?", (str(repo_b),))
+    ]
+    assert ids_b
+    assert _fetch(conn, ids_b, str(repo_a)) == {}
+    assert _fetch(conn, ids_b, str(repo_b))
+
+
+def test_symlinked_parent_directory_is_not_indexed(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "code.py").write_text("def inside(): pass\n")
+    _git(repo, "add", "pkg/code.py")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "code.py").write_text("def leaked(): pass\n")
+    shutil.rmtree(repo / "pkg")
+    (repo / "pkg").symlink_to(outside)
+
+    conn, stats = _index(repo, tmp_path)
+    names = {
+        row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(repo),))
+    }
+    assert names == set()
+    assert any("unreadable" in warning for warning in stats["warnings"])
+
+
+def test_index_repo_crash_does_not_poison_connection(tmp_path, monkeypatch):
+    from priorart import indexer
+
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def good(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    def exploding_drop(conn, ids):
+        conn.execute("DELETE FROM files WHERE repo = 'nonexistent'")
+        raise KeyboardInterrupt("simulated crash mid-index")
+
+    monkeypatch.setattr(indexer, "_drop_symbols", exploding_drop)
+    (repo / "sample.py").write_text("def changed(): pass\n")
+    with pytest.raises(KeyboardInterrupt):
+        index_repo(conn, repo)
+    assert not conn.in_transaction
+
+    # the same connection must keep serving searches after the crash
+    monkeypatch.undo()
+    report = search(conn, str(repo), "good", k=3)
+    assert report.symbol_count == 1
+
+
+def test_embedding_failure_without_warning_is_not_counted(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def good(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    conn, stats = _index(repo, tmp_path, embed_fn=lambda texts, *, query=False: (None, None))
+    assert stats["files"] == 0
+    assert stats["warnings"] == ["embedding failed without a warning"]
+    assert _file_rows(conn, repo) == set()
+
+
+def test_rerank_ignores_non_dict_and_bad_index_items(monkeypatch, tmp_path):
+    from priorart import rerank as rerank_mod
+    from priorart.config import Config
+
+    monkeypatch.setattr(
+        rerank_mod,
+        "post_json",
+        lambda *args, **kwargs: {
+            "results": [
+                None,
+                {"index": "0", "relevance_score": 0.9},
+                {"index": 0.7, "relevance_score": 0.9},
+                {"index": 1, "relevance_score": 0.5},
+            ]
+        },
+    )
+    config = Config(
+        llm_base_url=None,
+        llm_api_key=None,
+        embed_base_url=None,
+        embed_api_key=None,
+        rerank_base_url="http://rerank.example/v1",
+        rerank_api_key=None,
+        embed_model="",
+        embed_dim=4,
+        rerank_model="reranker",
+        llm_model="",
+        db_path=tmp_path / "rerank-test.db",
+    )
+    rerank = rerank_mod.make_reranker(config)
+    order, warning = rerank("query", ["doc0", "doc1"])
+    assert order == [(1, 0.5)]
+    assert warning == "rerank response had 3 malformed items"
+
+
+def test_valid_rerank_rejects_bool_and_nonfinite_scores():
+    assert _valid_rerank([(0, 1.0), (1, 0.5)], 2) is True
+    assert _valid_rerank([(0, True), (1, False)], 2) is False
+    assert _valid_rerank([(0, float("nan")), (1, 0.5)], 2) is False
+    assert _valid_rerank([(0, float("inf")), (1, 0.5)], 2) is False
+    assert _valid_rerank([("0", 1.0), (1, 0.5)], 2) is False
+
+
+def test_search_dense_path_inside_read_transaction(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text(SAMPLE)
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path, embed_fn=_vector)
+    vectorized = conn.execute(
+        "SELECT COUNT(*) FROM symbols_vec WHERE repo = ?", (str(repo),)
+    ).fetchone()[0]
+    assert vectorized == 3
+
+    report = search(conn, str(repo), "split unified diff", k=3, embed_fn=_vector)
+    assert report.candidates
+    assert report.warnings == []
+    assert not conn.in_transaction

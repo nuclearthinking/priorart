@@ -17,3 +17,11 @@ build/
 !.env.example
 .bench/
 scratch/
+
+.data/
+coverage/
+.gremlins_cache/
+.coverage
+.coverage.*
+.coveragerc.gremlins
+.pytest_cache/

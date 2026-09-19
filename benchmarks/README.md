@@ -47,3 +47,28 @@ model-specific ignored SQLite database, unless `PRIORART_DB` is set.
 The reported metrics are recall@k, MRR@k, p50/p95 query latency, total query
 time, and warning count. The first 50 reranked candidates are retained for
 failure analysis while the default quality cutoff remains ten.
+
+## Tracked obfuscated results
+
+`benchmarks/results/` keeps the shareable result history in the repository.
+Every file there is an obfuscated copy: organization and product names are
+replaced with abstract placeholders, queries keep their original wording
+otherwise. Raw results with original names stay under the ignored `.bench/`
+directory.
+
+Publish from a run:
+
+```bash
+uv run python benchmarks/run.py --suite ... --repo ... --publish
+```
+
+Or obfuscate existing artifacts without a rerun:
+
+```bash
+uv run python benchmarks/obfuscate.py .bench/results/*.json
+```
+
+The replacement vocabulary is private and must never enter the repository:
+it lives in the ignored `.bench/obfuscation.json` as a JSON object mapping
+sensitive terms to placeholders (`{"term": "placeholder"}`). Create it locally
+before publishing; `--publish` and the CLI fail loudly when it is missing.

@@ -37,16 +37,32 @@ def make_reranker(config: Config):
             )
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as err:
             return None, f"rerank failed ({err}); kept hybrid order"
-        results = payload.get("results")
-        if not isinstance(results, list) or not results:
-            return None, "rerank returned no results; kept hybrid order"
-        order = []
-        for item in results:
-            try:
-                score = float(item.get("relevance_score", item.get("score", 0.0)))
-                order.append((int(item["index"]), score))
-            except (KeyError, TypeError, ValueError):
-                continue
-        return order or None, None
+        return _parse_results(payload.get("results"))
 
     return rerank
+
+
+def _parse_results(results) -> tuple[list[tuple[int, float]] | None, str | None]:
+    if not isinstance(results, list) or not results:
+        return None, "rerank returned no results; kept hybrid order"
+    order = []
+    malformed = 0
+    for item in results:
+        if not isinstance(item, dict):
+            malformed += 1
+            continue
+        try:
+            index = item["index"]
+            score = float(item.get("relevance_score", item.get("score", 0.0)))
+        except (KeyError, TypeError, ValueError):
+            malformed += 1
+            continue
+        if not isinstance(index, int) or isinstance(index, bool):
+            malformed += 1
+            continue
+        order.append((index, score))
+    if not order:
+        return None, "rerank results contained no usable items; kept hybrid order"
+    if malformed:
+        return order, f"rerank response had {malformed} malformed items"
+    return order, None

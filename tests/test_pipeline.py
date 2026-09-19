@@ -18,13 +18,14 @@ class DiffViewer:
 
 
 def test_parse_source_extracts_symbols():
-    symbols = parse_source(SAMPLE.encode(), "python", "sample.py")
-    assert [symbol.qualname for symbol in symbols] == [
+    result = parse_source(SAMPLE.encode(), "python", "sample.py")
+    assert result.status == "ok"
+    assert [symbol.qualname for symbol in result.symbols] == [
         "parse_diff_patch",
         "DiffViewer",
         "DiffViewer.render",
     ]
-    top = symbols[0]
+    top = result.symbols[0]
     assert top.kind == "function"
     assert top.line == 1
     assert "Split a unified diff" in top.docstring
@@ -45,6 +46,16 @@ def test_rrf_favors_overlap():
     scores = rrf([[1, 5], [1, 9]])
     assert scores[1] > scores[5]
     assert scores[5] == scores[9]
+
+
+def test_parse_source_reports_empty_and_unsupported():
+    empty = parse_source(b"VALUE = 1\n", "python", "consts.py")
+    assert empty.status == "empty"
+    assert empty.symbols == []
+
+    unsupported = parse_source(b"x = 1\n", "no-such-lang", "sample.noext")
+    assert unsupported.status == "unsupported"
+    assert unsupported.symbols == []
 
 
 def test_config_supports_shared_provider_with_service_overrides(monkeypatch, tmp_path):

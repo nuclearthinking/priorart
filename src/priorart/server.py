@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import subprocess
-import threading
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
 from .runtime import Runtime
-from .search import format_report, map_symbols_text, status_text
+from .search import format_report
 
 INSTRUCTIONS = (
     "Codebase search over one indexed repository. Before implementing a new "
@@ -28,8 +27,8 @@ NO_REPO = (
 
 def _git_root(start: Path) -> Path | None:
     try:
-        out = subprocess.run(
-            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+        out = subprocess.run(  # noqa: S603 - fixed git argv
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],  # noqa: S607
             capture_output=True,
             text=True,
             check=True,
@@ -42,7 +41,6 @@ def _git_root(start: Path) -> Path | None:
 def build_server(repo: Path | None = None) -> MCPServer:
     root = Path(repo) if repo is not None else _git_root(Path.cwd())
     runtime = Runtime(root) if root is not None else None
-    lock = threading.Lock()
     mcp = MCPServer("priorart", instructions=INSTRUCTIONS)
 
     @mcp.tool()
@@ -62,24 +60,20 @@ def build_server(repo: Path | None = None) -> MCPServer:
         """List indexed symbols under a path glob, for example 'src/**' or '*gateway*'."""
         if runtime is None:
             return NO_REPO
-        return map_symbols_text(runtime.conn, str(runtime.repo), path_glob)
+        return runtime.map_symbols(path_glob)
 
     @mcp.tool()
-    def refresh_index(rebuild: bool = False) -> str:
+    def refresh_index(rebuild: bool = False) -> str:  # noqa: FBT001, FBT002
         """Reindex the repository. Incremental by default; rebuild=True re-embeds everything."""
         if runtime is None:
             return NO_REPO
-        with lock:
-            stats = runtime.reindex(rebuild=rebuild)
+        stats = runtime.reindex(rebuild=rebuild)
         parts = [
             f"indexed {stats['files']} changed files, {stats['symbols']} symbols in them",
         ]
         if stats.get("removed"):
             parts.append(f"removed {stats['removed']} deleted files")
-        total = runtime.conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE repo = ?", (str(runtime.repo),)
-        ).fetchone()[0]
-        parts.append(f"index total {total} symbols")
+        parts.append(f"index total {runtime.symbol_count()} symbols")
         lines = [", ".join(parts)]
         lines.extend(f"warning: {warning}" for warning in stats.get("warnings", []))
         return "\n".join(lines)
@@ -90,6 +84,6 @@ def build_server(repo: Path | None = None) -> MCPServer:
         state, staleness with reasons, and vector coverage."""
         if runtime is None:
             return NO_REPO
-        return status_text(runtime.conn, str(runtime.repo), dense=runtime.embed is not None)
+        return runtime.status()
 
     return mcp

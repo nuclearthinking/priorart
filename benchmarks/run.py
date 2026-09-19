@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -13,6 +14,15 @@ from pathlib import Path
 from priorart.runtime import Runtime
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _obfuscation():
+    path = Path(__file__).resolve().parent / "obfuscate.py"
+    spec = importlib.util.spec_from_file_location("priorart_benchmark_obfuscate", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def expected_rank(results: list[dict], expected: dict) -> int | None:
@@ -112,6 +122,18 @@ def main() -> None:
     print(json.dumps(result["summary"], indent=2))
     print(f"saved: {output}")
 
+    if args.publish:
+        obfuscate = _obfuscation()
+        obfuscator = obfuscate.Obfuscator(
+            obfuscate.load_replacements(obfuscate.DEFAULT_REPLACEMENTS_PATH)
+        )
+        published = ROOT / "benchmarks" / "results" / obfuscator.text(output.name)
+        published.parent.mkdir(parents=True, exist_ok=True)
+        published.write_text(
+            json.dumps(obfuscator.value(result), ensure_ascii=False, indent=2) + "\n"
+        )
+        print(f"published: {published}")
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a priorart golden benchmark.")
@@ -122,6 +144,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("-k", type=int, default=10)
     parser.add_argument("--candidate-depth", type=int, default=50)
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Also save an obfuscated copy to benchmarks/results/ for the tracked history",
+    )
     return parser.parse_args()
 
 

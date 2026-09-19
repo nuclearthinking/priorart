@@ -1,0 +1,1748 @@
+{
+  "suite": "atlas-master-v1",
+  "revision": "3f7a9c2e5b1d4f08a6c3e9b2d7f5a1c8e4b6d0f2",
+  "created_at": "2026-09-19T15:00:44.634521+00:00",
+  "label": "remote-qwen3-8b",
+  "models": {
+    "embedding": "qwen3-embedding-8b",
+    "embedding_dimension": 4096,
+    "reranker": "qwen3-reranker-8b",
+    "query_expansion": "glm-5.3"
+  },
+  "k": 10,
+  "index": {
+    "files": 716,
+    "symbols": 8015,
+    "removed": 0,
+    "warnings": []
+  },
+  "summary": {
+    "recall_at_10": 0.7,
+    "mrr_at_10": 0.4572222222222222,
+    "latency_p50_seconds": 8.895976333413273,
+    "latency_p95_seconds": 19.856636708136648,
+    "queries_with_warnings": 0
+  },
+  "cases": [
+    {
+      "id": "atlas-122-metadata-repair-defaults",
+      "issue_iid": 122,
+      "issue_title": "Metadata repair отвергает корректный repair, если ответ модели без дефолтных полей",
+      "query": "Я чиню repair структурированного ответа генерации гипотез: исходный JSON может не содержать поля с default-значениями, но исправленная версия должна менять только недопустимые ссылки на требования. Есть ли уже место, где сравнивается исходный и repaired ответ и запрещаются semantic-изменения?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/services/review_hypothesis/models.py",
+        "qualname": "HypothesisPackResponse.validate_metadata_repair"
+      },
+      "rationale": "This validator owns the metadata-only repair boundary and compares the original and repaired responses.",
+      "rank": 1,
+      "latency_seconds": 10.83658279106021,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/models.py",
+          "qualname": "HypothesisPackResponse.validate_metadata_repair",
+          "kind": "function",
+          "line": 260,
+          "score": 0.9933401942253113
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_workers.py",
+          "qualname": "test_confirmation_repair_keeps_semantic_hint",
+          "kind": "function",
+          "line": 129,
+          "score": 0.9828647375106812
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/models.py",
+          "qualname": "_repair_source_error",
+          "kind": "function",
+          "line": 308,
+          "score": 0.972066342830658
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_prompt_contracts.py",
+          "qualname": "test_schema_repair_cannot_change_valid_review_decisions",
+          "kind": "function",
+          "line": 563,
+          "score": 0.9703419208526611
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/service.py",
+          "qualname": "ReReviewMemoryService._require_diff_refs",
+          "kind": "function",
+          "line": 388,
+          "score": 0.9642148017883301
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_workers.py",
+          "qualname": "_assert_hypothesis_turn_repair_policy",
+          "kind": "function",
+          "line": 1669,
+          "score": 0.9425134062767029
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/planning/model_calls.py",
+          "qualname": "StructuredModelSemanticError",
+          "kind": "class",
+          "line": 35,
+          "score": 0.9294612407684326
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/models.py",
+          "qualname": "_require_metadata_only_repair",
+          "kind": "function",
+          "line": 285,
+          "score": 0.9177988171577454
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_hypothesis_metadata.py",
+          "qualname": "test_metadata_repair_rule_holds_for_well_formed_source_with_bad_refs",
+          "kind": "function",
+          "line": 322,
+          "score": 0.8711792826652527
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_hypothesis_metadata.py",
+          "qualname": "test_partition_errors_in_the_source_allow_a_fresh_repair",
+          "kind": "function",
+          "line": 379,
+          "score": 0.8391696214675903
+        }
+      ]
+    },
+    {
+      "id": "atlas-118-cancel-closed-merge-request",
+      "issue_iid": 118,
+      "issue_title": "Автоматически отменять ревью merged/closed MR без зависимости от webhook",
+      "query": "Хочу периодически сверять состояние merge request и останавливать queued или running review после merge/close, переиспользуя тот же идемпотентный lifecycle, что и webhook. Где уже реализована такая отмена?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/runtime_control.py",
+        "qualname": "cancel_active_merge_request_review"
+      },
+      "rationale": "This is the existing cancellation boundary for queued/running reviews and Temporal executions.",
+      "rank": 1,
+      "latency_seconds": 6.863602375146002,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/runtime_control.py",
+          "qualname": "cancel_active_merge_request_review",
+          "kind": "function",
+          "line": 26,
+          "score": 0.9948493838310242
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/webhooks.py",
+          "qualname": "GitLabMergeRequestWebhook",
+          "kind": "class",
+          "line": 76,
+          "score": 0.9897328019142151
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/temporal/reconciliation.py",
+          "qualname": "_reconcile_canceled_review_run",
+          "kind": "function",
+          "line": 175,
+          "score": 0.9883204698562622
+        },
+        {
+          "path": "tests/pipelines/code_review/test_gitlab_webhook_api.py",
+          "qualname": "test_merge_request_webhook_merge_deletes_queued_run_",
+          "kind": "function",
+          "line": 868,
+          "score": 0.9862280488014221
+        },
+        {
+          "path": "tests/pipelines/code_review/test_gitlab_webhook_api.py",
+          "qualname": "test_merge_request_webhook_close_cancels_materialized_queued_restart",
+          "kind": "function",
+          "line": 780,
+          "score": 0.9818596243858337
+        },
+        {
+          "path": "tests/pipelines/code_review/test_gitlab_webhook_api.py",
+          "qualname": "test_merge_request_webhook_close_cancels_running_run",
+          "kind": "function",
+          "line": 575,
+          "score": 0.980705201625824
+        },
+        {
+          "path": "tests/pipelines/code_review/test_gitlab_webhook_api.py",
+          "qualname": "test_merge_request_webhook_merge_cancels_active_run",
+          "kind": "function",
+          "line": 910,
+          "score": 0.9790401458740234
+        },
+        {
+          "path": "tests/pipelines/code_review/test_gitlab_webhook_api.py",
+          "qualname": "test_merge_request_webhook_close_cancels_run_claimed_from_queue",
+          "kind": "function",
+          "line": 666,
+          "score": 0.9783036112785339
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/temporal/activities.py",
+          "qualname": "cancel_review_run_activity",
+          "kind": "function",
+          "line": 629,
+          "score": 0.9710971117019653
+        },
+        {
+          "path": "tests/pipelines/code_review/temporal/test_code_review_temporal_worker.py",
+          "qualname": "test_reconcile_running_review_runs_cancels_missing_temporal_execution",
+          "kind": "function",
+          "line": 1172,
+          "score": 0.9699208736419678
+        }
+      ]
+    },
+    {
+      "id": "atlas-111-straggler-budget",
+      "issue_iid": 111,
+      "issue_title": "Стадия становится заложником одного долгого unit",
+      "query": "I want to introduce a stricter budget when one parallel review unit is the last remaining straggler, while preserving the existing active-work limit and focus-only tail mode. Where is the current review-unit budget policy assembled?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/services/review_budget_thresholds.py",
+        "qualname": "build_review_budget_threshold_policy"
+      },
+      "rationale": "This function assembles the current unit budget, tail mode, tools, and transition message.",
+      "rank": 2,
+      "latency_seconds": 4.218293624930084,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/agent_runtime/langgraph/state_updates.py",
+          "qualname": "load_budget_policy",
+          "kind": "function",
+          "line": 144,
+          "score": 0.9299171566963196
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_budget_thresholds.py",
+          "qualname": "build_review_budget_threshold_policy",
+          "kind": "function",
+          "line": 13,
+          "score": 0.9068815112113953
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_budget.py",
+          "qualname": "ReviewAdaptiveBudgetService",
+          "kind": "class",
+          "line": 151,
+          "score": 0.8730958700180054
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_budget.py",
+          "qualname": "AdaptiveBudgetPolicy.resolve_budget",
+          "kind": "function",
+          "line": 94,
+          "score": 0.772172749042511
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_budget.py",
+          "qualname": "ReviewAdaptiveBudgetService.resolve_budget",
+          "kind": "function",
+          "line": 187,
+          "score": 0.7073261737823486
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_summary.py",
+          "qualname": "ReviewRunSummaryService._resolve_run_budget",
+          "kind": "function",
+          "line": 401,
+          "score": 0.5692360997200012
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_budget.py",
+          "qualname": "ResolvedReviewBudget",
+          "kind": "class",
+          "line": 24,
+          "score": 0.5265837907791138
+        },
+        {
+          "path": "src/atlas/agent_runtime/policy.py",
+          "qualname": "RuntimeTurnRepairPolicy.repair_budget_remaining",
+          "kind": "function",
+          "line": 107,
+          "score": 0.4786258935928345
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_confirmation_verification.py",
+          "qualname": "_budget_exhausted_assessment",
+          "kind": "function",
+          "line": 637,
+          "score": 0.4076637625694275
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/temporal/stage_definitions.py",
+          "qualname": "_budget_exhausted_assessment",
+          "kind": "function",
+          "line": 3416,
+          "score": 0.4076637625694275
+        }
+      ]
+    },
+    {
+      "id": "atlas-78-stop-repeated-repair",
+      "issue_iid": 78,
+      "issue_title": "Останавливать повторяющиеся repair-ошибки до исчерпания бюджета",
+      "query": "Нужно прекращать повтор одинакового невалидного model/tool turn без прогресса, но сохранять ограниченные попытки для исправимых ошибок и статистику repair. Есть ли общий цикл восстановления turn, который надо расширить?",
+      "expected": {
+        "path": "src/atlas/agent_runtime/runtime/repair.py",
+        "qualname": "run_with_repair"
+      },
+      "rationale": "The shared repair loop owns classification, budgets, statistics, and no-progress termination.",
+      "rank": null,
+      "latency_seconds": 4.4222010830417275,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/agent_runtime/runtime/model_turns/tool_loop_turn.py",
+          "qualname": "ToolLoopTurnRunner._run_turn_with_repair",
+          "kind": "function",
+          "line": 173,
+          "score": 0.9923336505889893
+        },
+        {
+          "path": "src/atlas/agent_runtime/policy.py",
+          "qualname": "RuntimeTurnRepairPolicy",
+          "kind": "class",
+          "line": 60,
+          "score": 0.9890069961547852
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/repair.py",
+          "qualname": "TurnRepairAttemptContext",
+          "kind": "class",
+          "line": 35,
+          "score": 0.9831646084785461
+        },
+        {
+          "path": "tests/services/test_model_observability.py",
+          "qualname": "CountingRepairingToolTurnModelClient",
+          "kind": "class",
+          "line": 570,
+          "score": 0.9776490330696106
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/model_turns/tool_loop_turn.py",
+          "qualname": "ToolLoopTurnRunner",
+          "kind": "class",
+          "line": 77,
+          "score": 0.9747473001480103
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_agent_tasks.py",
+          "qualname": "_build_verification_turn_repair_policy",
+          "kind": "function",
+          "line": 758,
+          "score": 0.9612312912940979
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_agent_tasks.py",
+          "qualname": "_build_hypothesis_turn_repair_policy",
+          "kind": "function",
+          "line": 665,
+          "score": 0.9576486945152283
+        },
+        {
+          "path": "src/atlas/agent_runtime/temporal/contracts.py",
+          "qualname": "TemporalTurnRepairPolicy",
+          "kind": "class",
+          "line": 60,
+          "score": 0.9566015005111694
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/repair.py",
+          "qualname": "TurnRepairStats",
+          "kind": "class",
+          "line": 20,
+          "score": 0.9516684412956238
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_workers.py",
+          "qualname": "_assert_tool_turn_repair_policy",
+          "kind": "function",
+          "line": 1728,
+          "score": 0.9480534195899963
+        }
+      ]
+    },
+    {
+      "id": "atlas-104-incremental-outcome-batches",
+      "issue_iid": 104,
+      "issue_title": "Исправить incremental record_outcomes и диагностику hypothesis IDs",
+      "query": "I need an incremental outcome batch to reference supporting outcomes persisted by earlier batches, then validate the combined state without resending every record. Is there already a helper that combines recorded progress batches?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/lifecycle/investigation.py",
+        "qualname": "merge_progress_batches"
+      },
+      "rationale": "This helper merges persisted batches, deduplicates records, and validates the combined response.",
+      "rank": 1,
+      "latency_seconds": 19.61691641714424,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/lifecycle/investigation.py",
+          "qualname": "merge_progress_batches",
+          "kind": "function",
+          "line": 104,
+          "score": 0.9996683597564697
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/lifecycle/investigation.py",
+          "qualname": "recorded_batches",
+          "kind": "function",
+          "line": 96,
+          "score": 0.9526143074035645
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/lifecycle/models.py",
+          "qualname": "validate_outcomes",
+          "kind": "function",
+          "line": 147,
+          "score": 0.9112823009490967
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/frontend_views.py",
+          "qualname": "_merge_stage_progress",
+          "kind": "function",
+          "line": 50,
+          "score": 0.8642089366912842
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/runtime_tasks.py",
+          "qualname": "HypothesisRuntimeTaskRunner._persist_outcome",
+          "kind": "function",
+          "line": 388,
+          "score": 0.7207637429237366
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/storage_models.py",
+          "qualname": "ReviewIntakeStageOutput.validate_outcome",
+          "kind": "function",
+          "line": 205,
+          "score": 0.7149819731712341
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/lifecycle/repository.py",
+          "qualname": "HypothesisRepository.record_progress",
+          "kind": "function",
+          "line": 267,
+          "score": 0.7040626406669617
+        },
+        {
+          "path": "src/atlas/agent_runtime/context/lifecycle.py",
+          "qualname": "_require_complete_history",
+          "kind": "function",
+          "line": 562,
+          "score": 0.6938003897666931
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/planning/assignments.py",
+          "qualname": "_build_combined_assignments",
+          "kind": "function",
+          "line": 407,
+          "score": 0.6416046023368835
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/domain/models.py",
+          "qualname": "_validate_decision_outcome",
+          "kind": "function",
+          "line": 432,
+          "score": 0.5311314463615417
+        }
+      ]
+    },
+    {
+      "id": "atlas-53-task-context-excerpt",
+      "issue_iid": 53,
+      "issue_title": "Сохранять цитируемый excerpt task context при truncation",
+      "query": "Хочу при ограничении размера task context сохранять цитируемый фрагмент с source ID и явной неполнотой, не превышая общий бюджет prompt. Где сейчас выполняется финальное сжатие контекста?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/services/task_context_inputs.py",
+        "qualname": "TaskContextInputBuilder._enforce_total_budget"
+      },
+      "rationale": "This method performs final context trimming against the total prompt budget.",
+      "rank": 10,
+      "latency_seconds": 7.497467207722366,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/services/task_context_inputs.py",
+          "qualname": "TaskContextLimits",
+          "kind": "class",
+          "line": 15,
+          "score": 0.9186780452728271
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_model_inputs.py",
+          "qualname": "ReviewModelInputBuilderService.build_task_context_input",
+          "kind": "function",
+          "line": 405,
+          "score": 0.8861186504364014
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/model_turns/tool_loop_turn.py",
+          "qualname": "ToolLoopTurnRunner._summarize_context",
+          "kind": "function",
+          "line": 556,
+          "score": 0.8499289155006409
+        },
+        {
+          "path": "tests/pipelines/code_review/re_review_memory/test_service.py",
+          "qualname": "_context_slice",
+          "kind": "function",
+          "line": 94,
+          "score": 0.8498713374137878
+        },
+        {
+          "path": "src/atlas/agent_runtime/context/lifecycle.py",
+          "qualname": "ContextLifecycle._compact",
+          "kind": "function",
+          "line": 266,
+          "score": 0.8004814982414246
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "ReviewContextService.collect_context",
+          "kind": "function",
+          "line": 183,
+          "score": 0.7921851873397827
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/intake.py",
+          "qualname": "ReviewIntakeService._capture_task_context",
+          "kind": "function",
+          "line": 293,
+          "score": 0.7786189913749695
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_hypothesis_metadata.py",
+          "qualname": "_task",
+          "kind": "function",
+          "line": 43,
+          "score": 0.7743737697601318
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/domain/models.py",
+          "qualname": "ContextSlice",
+          "kind": "class",
+          "line": 243,
+          "score": 0.7591086626052856
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/task_context_inputs.py",
+          "qualname": "TaskContextInputBuilder._enforce_total_budget",
+          "kind": "function",
+          "line": 155,
+          "score": 0.7528871297836304
+        }
+      ]
+    },
+    {
+      "id": "atlas-41-transcript-message-identity",
+      "issue_iid": 41,
+      "issue_title": "Сохранять transcript по identity сообщения",
+      "query": "I need transcript persistence to deduplicate a retried batch by stable turn identity while still keeping identical message payloads produced by different turns. Where is transcript append and sequencing currently handled?",
+      "expected": {
+        "path": "src/atlas/storage/messages.py",
+        "qualname": "PipelineMessagesRepository.append_missing_suffix"
+      },
+      "rationale": "This transactional append assigns transcript sequence and currently performs payload-based suffix deduplication.",
+      "rank": null,
+      "latency_seconds": 10.728764292318374,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/agent_runtime/langgraph/runtime.py",
+          "qualname": "RuntimeSessionOperations.persist_runtime_turn",
+          "kind": "function",
+          "line": 81,
+          "score": 0.894403338432312
+        },
+        {
+          "path": "src/atlas/agent_runtime/temporal/activities.py",
+          "qualname": "persist_agent_turn_activity",
+          "kind": "function",
+          "line": 462,
+          "score": 0.8771597146987915
+        },
+        {
+          "path": "src/atlas/storage/tool_calls.py",
+          "qualname": "PipelineToolCallsRepository.append_once_with_status",
+          "kind": "function",
+          "line": 97,
+          "score": 0.8507847189903259
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/operations.py",
+          "qualname": "AgentRuntimeSessionOperations.persist_runtime_turn",
+          "kind": "function",
+          "line": 385,
+          "score": 0.8238344788551331
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/operations.py",
+          "qualname": "persist_runtime_turn",
+          "kind": "function",
+          "line": 850,
+          "score": 0.8169373869895935
+        },
+        {
+          "path": "tests/agent_runtime/langgraph/test_runtime.py",
+          "qualname": "test_langgraph_runtime_flags_repeated_identical_tool_calls.persist_runtime_turn",
+          "kind": "function",
+          "line": 684,
+          "score": 0.7090194225311279
+        },
+        {
+          "path": "tests/agent_runtime/langgraph/test_runtime.py",
+          "qualname": "test_langgraph_runtime_persists_final_output_and_resumes.persist_runtime_turn",
+          "kind": "function",
+          "line": 165,
+          "score": 0.7090194225311279
+        },
+        {
+          "path": "src/atlas/agent_runtime/langgraph/runtime.py",
+          "qualname": "RuntimeSessionOperations.append_runtime_messages",
+          "kind": "function",
+          "line": 77,
+          "score": 0.5539732575416565
+        },
+        {
+          "path": "tests/agent_runtime/test_model_execution_integration.py",
+          "qualname": "_append_input",
+          "kind": "function",
+          "line": 117,
+          "score": 0.49830979108810425
+        },
+        {
+          "path": "src/atlas/storage/tool_calls.py",
+          "qualname": "PipelineToolCallsRepository.append",
+          "kind": "function",
+          "line": 29,
+          "score": 0.4343353509902954
+        }
+      ]
+    },
+    {
+      "id": "atlas-55-malformed-diff-coverage",
+      "issue_iid": 55,
+      "issue_title": "Не терять из coverage файлы с повреждённым diff",
+      "query": "Я исправляю coverage: changed file с malformed или truncated diff может не породить ни одного context slice, но всё равно должен получить явный skipped outcome с причиной на уровне файла. Есть ли уже helper для такой записи coverage?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/services/context.py",
+        "qualname": "_ContextCollectionAccumulator.add_file_skipped_entry"
+      },
+      "rationale": "This helper records a file-level skipped coverage entry independently of context slices.",
+      "rank": 1,
+      "latency_seconds": 12.587402459234,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "_ContextCollectionAccumulator.add_file_skipped_entry",
+          "kind": "function",
+          "line": 115,
+          "score": 0.9972493052482605
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "_whole_file_skip_reason",
+          "kind": "function",
+          "line": 743,
+          "score": 0.9890788197517395
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "_ContextCollectionAccumulator.add_skipped_entry",
+          "kind": "function",
+          "line": 99,
+          "score": 0.9670280814170837
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_workers.py",
+          "qualname": "_context_slice",
+          "kind": "function",
+          "line": 1863,
+          "score": 0.9165289402008057
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/domain/mappers.py",
+          "qualname": "ReviewStateMapper._map_changed_file",
+          "kind": "function",
+          "line": 141,
+          "score": 0.9109727740287781
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/enums.py",
+          "qualname": "CoverageStatus",
+          "kind": "class",
+          "line": 28,
+          "score": 0.9039551615715027
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "ReviewContextService._build_coverage_entry",
+          "kind": "function",
+          "line": 697,
+          "score": 0.8973269462585449
+        },
+        {
+          "path": "tests/pipelines/code_review/re_review_memory/test_service.py",
+          "qualname": "_context_slice",
+          "kind": "function",
+          "line": 94,
+          "score": 0.8847248554229736
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/storage.py",
+          "qualname": "ReviewStorage.mark_run_skipped",
+          "kind": "function",
+          "line": 1225,
+          "score": 0.8645698428153992
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "_ContextCollectionAccumulator.add_skipped_entries",
+          "kind": "function",
+          "line": 72,
+          "score": 0.8326876759529114
+        }
+      ]
+    },
+    {
+      "id": "atlas-22-canonical-finding-anchor",
+      "issue_iid": 22,
+      "issue_title": "Сохранять causal anchor из evidence и не принимать выдуманный line_text",
+      "query": "Я хочу получать точный anchor комментария из frozen diff/read evidence, а не доверять строке, которую воспроизвела модель. Есть ли уже логика проверки path, side, line и текста с безопасным переносом только на единственное совпадение среди changed lines?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/services/review_finding_location.py",
+        "qualname": "canonicalize_finding_location"
+      },
+      "rationale": "This function verifies the location and only relocates it on one unambiguous changed-line match.",
+      "rank": null,
+      "latency_seconds": 3.9468685830943286,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/integrations/review_backend.py",
+          "qualname": "ReviewBackendClient.resolve_comment_anchor",
+          "kind": "function",
+          "line": 61,
+          "score": 0.9862863421440125
+        },
+        {
+          "path": "src/atlas/integrations/review_api.py",
+          "qualname": "ReviewApiClient.resolve_comment_anchor",
+          "kind": "function",
+          "line": 272,
+          "score": 0.9862863421440125
+        },
+        {
+          "path": "tests/pipelines/code_review/review_testkit.py",
+          "qualname": "FakeIntakeReviewClient.resolve_comment_anchor",
+          "kind": "function",
+          "line": 112,
+          "score": 0.9862863421440125
+        },
+        {
+          "path": "tests/gremlins_scope.py",
+          "qualname": "_changed_lines",
+          "kind": "function",
+          "line": 164,
+          "score": 0.9435282945632935
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_finding_location.py",
+          "qualname": "_ChangedLine",
+          "kind": "class",
+          "line": 10,
+          "score": 0.9408383369445801
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_publish.py",
+          "qualname": "ReviewPublishService._apply_anchor_resolution",
+          "kind": "function",
+          "line": 903,
+          "score": 0.9404899477958679
+        },
+        {
+          "path": "src/atlas/integrations/review_models.py",
+          "qualname": "ResolvedCommentAnchorResult",
+          "kind": "class",
+          "line": 665,
+          "score": 0.9393226504325867
+        },
+        {
+          "path": "src/atlas/integrations/review_models.py",
+          "qualname": "CommentAnchorTarget",
+          "kind": "class",
+          "line": 653,
+          "score": 0.9101494550704956
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_publish.py",
+          "qualname": "_Client.resolve_comment_anchor",
+          "kind": "function",
+          "line": 230,
+          "score": 0.9075466394424438
+        },
+        {
+          "path": "src/atlas/integrations/review_models.py",
+          "qualname": "UnresolvedCommentAnchorResult",
+          "kind": "class",
+          "line": 688,
+          "score": 0.8832655549049377
+        }
+      ]
+    },
+    {
+      "id": "atlas-32-search-tool-surface",
+      "issue_iid": 32,
+      "issue_title": "Разделить literal и regex search и поиск файлов: исключить ложное отрицательное evidence",
+      "query": "Я развожу literal и regex repository search, а content search отделяю от bounded file listing. Нужно сохранить единые schemas, descriptions, normalizers и snapshot restrictions для model-facing MCP tools. Где централизованно объявлена эта поверхность инструментов?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/tools/runtime_surface.py",
+        "qualname": "_build_review_mcp_tool_bindings"
+      },
+      "rationale": "This factory binds tool IDs, model-facing descriptions, schemas, normalizers, and snapshot constraints.",
+      "rank": null,
+      "latency_seconds": 4.321925458032638,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/tools/mcp_client.py",
+          "qualname": "McpToolDescriptor",
+          "kind": "class",
+          "line": 49,
+          "score": 0.9369503259658813
+        },
+        {
+          "path": "src/atlas/tools/mcp_runtime.py",
+          "qualname": "register_mcp_tools",
+          "kind": "function",
+          "line": 161,
+          "score": 0.9025478363037109
+        },
+        {
+          "path": "src/atlas/tools/mcp_runtime.py",
+          "qualname": "_build_mcp_tool_definition",
+          "kind": "function",
+          "line": 176,
+          "score": 0.8934954404830933
+        },
+        {
+          "path": "src/atlas/tools/mcp_runtime.py",
+          "qualname": "McpToolBinding",
+          "kind": "class",
+          "line": 28,
+          "score": 0.855832576751709
+        },
+        {
+          "path": "tests/tools/test_tools.py",
+          "qualname": "_register_tools",
+          "kind": "function",
+          "line": 140,
+          "score": 0.8034918308258057
+        },
+        {
+          "path": "src/atlas/tools/mcp_client.py",
+          "qualname": "McpClient.list_tools",
+          "kind": "function",
+          "line": 270,
+          "score": 0.7371342778205872
+        },
+        {
+          "path": "src/atlas/tools/contracts.py",
+          "qualname": "ToolDefinition",
+          "kind": "class",
+          "line": 82,
+          "score": 0.6543445587158203
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/tools/runtime_surface.py",
+          "qualname": "register_review_mcp_tools",
+          "kind": "function",
+          "line": 314,
+          "score": 0.6386024355888367
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/model_turns/tool_loop_turn.py",
+          "qualname": "ToolLoopTurnRunner._tool_descriptors_for",
+          "kind": "function",
+          "line": 417,
+          "score": 0.5980979800224304
+        },
+        {
+          "path": "src/atlas/llm/adapters/schema_normalization.py",
+          "qualname": "_find_tool_schema",
+          "kind": "function",
+          "line": 39,
+          "score": 0.5821635723114014
+        }
+      ]
+    },
+    {
+      "id": "atlas-114-dependency-search-contract",
+      "issue_iid": 114,
+      "issue_title": "search_dependency_source систематически получает недопустимые аргументы",
+      "query": "Я улучшаю контракт поиска по frozen dependency source: модель превышает лимиты context before/after и передаёт несуществующие path prefixes. Где уже заданы input constraints для этого вызова, чтобы расширить schema и typed diagnostics без нового параллельного контракта?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/tools/runtime_surface.py",
+        "qualname": "McpSearchDependencySourceInput"
+      },
+      "rationale": "This input model defines the dependency search arguments and their numeric limits.",
+      "rank": 1,
+      "latency_seconds": 9.845020500011742,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/tools/runtime_surface.py",
+          "qualname": "McpSearchDependencySourceInput",
+          "kind": "class",
+          "line": 272,
+          "score": 0.9883617758750916
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/tools/runtime_surface.py",
+          "qualname": "McpReadDependencySourceInput",
+          "kind": "class",
+          "line": 288,
+          "score": 0.9643120169639587
+        },
+        {
+          "path": "src/atlas/integrations/review_models.py",
+          "qualname": "McpDependencySearchResult",
+          "kind": "class",
+          "line": 414,
+          "score": 0.9596806764602661
+        },
+        {
+          "path": "src/atlas/integrations/review_models.py",
+          "qualname": "McpDependencySearchMatch",
+          "kind": "class",
+          "line": 405,
+          "score": 0.953965425491333
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/tools/runtime_surface.py",
+          "qualname": "McpResolveDependencyInput",
+          "kind": "class",
+          "line": 230,
+          "score": 0.9294000864028931
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_agent_tasks.py",
+          "qualname": "_dependency_source_trace",
+          "kind": "function",
+          "line": 175,
+          "score": 0.9013621807098389
+        },
+        {
+          "path": "tests/review_feedback/test_evidence.py",
+          "qualname": "test_context_limit_is_explicit_and_contract_is_frozen",
+          "kind": "function",
+          "line": 287,
+          "score": 0.891448438167572
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/tools/runtime_surface.py",
+          "qualname": "McpSearchScopeInput",
+          "kind": "class",
+          "line": 178,
+          "score": 0.8759229183197021
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/temporal/stage_definitions.py",
+          "qualname": "_check_dependency_source",
+          "kind": "function",
+          "line": 519,
+          "score": 0.8583455681800842
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/tools/runtime_surface.py",
+          "qualname": "_normalize_dependency_search_result",
+          "kind": "function",
+          "line": 516,
+          "score": 0.8218452334403992
+        }
+      ]
+    },
+    {
+      "id": "atlas-38-idempotent-artifact-insert",
+      "issue_iid": 38,
+      "issue_title": "Сократить лишние запросы Postgres при записи artifacts",
+      "query": "Хочу убрать SELECT перед вставкой immutable artifact: сделать INSERT ON CONFLICT и при duplicate проверить, что payload тот же. Есть ли уже в проекте такой idempotent persistence pattern, который можно переиспользовать?",
+      "expected": {
+        "path": "src/atlas/metrics/service.py",
+        "qualname": "accept_event"
+      },
+      "rationale": "This code inserts on conflict, reads the existing digest, and rejects a conflicting payload.",
+      "rank": null,
+      "latency_seconds": 18.617161499802023,
+      "warnings": [],
+      "results": [
+        {
+          "path": "tests/pipelines/code_review/temporal/test_code_review_temporal_activities.py",
+          "qualname": "test_supported_p0_creates_adjudicator_task_artifact.upsert_artifact",
+          "kind": "function",
+          "line": 2314,
+          "score": 0.9718928933143616
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_hypothesis_runtime_tasks.py",
+          "qualname": "_FakeStorage.upsert_artifact_by_key",
+          "kind": "function",
+          "line": 802,
+          "score": 0.9638429880142212
+        },
+        {
+          "path": "tests/pipelines/code_review/temporal/test_code_review_temporal_activities.py",
+          "qualname": "test_prepare_investigation_units_activity_returns_stable_unit_refs.upsert_artifact_by_key",
+          "kind": "function",
+          "line": 1237,
+          "score": 0.9638429880142212
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/storage.py",
+          "qualname": "ReviewStorage.upsert_artifact_by_key",
+          "kind": "function",
+          "line": 1591,
+          "score": 0.9638429880142212
+        },
+        {
+          "path": "tests/pipelines/code_review/temporal/test_code_review_temporal_activities.py",
+          "qualname": "test_prepare_confirmation_units_activity_persists_stage_scoped_units.upsert_artifact_by_key",
+          "kind": "function",
+          "line": 1555,
+          "score": 0.9638429880142212
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_finding_reconciliation.py",
+          "qualname": "_Storage.upsert_artifact_by_key",
+          "kind": "function",
+          "line": 91,
+          "score": 0.9591202735900879
+        },
+        {
+          "path": "tests/metrics/test_metric_service.py",
+          "qualname": "test_delivery_is_idempotent_and_rejects_changed_payload",
+          "kind": "function",
+          "line": 79,
+          "score": 0.9590015411376953
+        },
+        {
+          "path": "tests/pipelines/code_review/temporal/test_code_review_temporal_activities.py",
+          "qualname": "test_prepare_hypothesis_activity_persists_budget_for_later_completion.upsert_artifact_by_key",
+          "kind": "function",
+          "line": 1095,
+          "score": 0.9556406736373901
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/storage.py",
+          "qualname": "ReviewStorage._upsert_artifact_for_execution",
+          "kind": "function",
+          "line": 1614,
+          "score": 0.9541951417922974
+        },
+        {
+          "path": "src/atlas/storage/tool_calls.py",
+          "qualname": "PipelineToolCallsRepository.append_once",
+          "kind": "function",
+          "line": 63,
+          "score": 0.9500231146812439
+        }
+      ]
+    },
+    {
+      "id": "atlas-37-bounded-context-ranges",
+      "issue_iid": 37,
+      "issue_title": "Читать bounded ranges при сборе context",
+      "query": "Переделываю сбор review context, чтобы backend читал только нужные диапазоны строк и объединял пересекающиеся интервалы, а не тащил файл до EOF. Где сейчас централизован backend read для source context, который надо расширить?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/services/context.py",
+        "qualname": "ReviewContextService._read_source_file"
+      },
+      "rationale": "This is the centralized backend source-read boundary and currently requests the whole file.",
+      "rank": 2,
+      "latency_seconds": 6.34741691686213,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "ReviewContextService",
+          "kind": "class",
+          "line": 174,
+          "score": 0.9282842874526978
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "ReviewContextService._read_source_file",
+          "kind": "function",
+          "line": 517,
+          "score": 0.8666917681694031
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "ReviewContextService.collect_context",
+          "kind": "function",
+          "line": 183,
+          "score": 0.8226224780082703
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "ReviewContextService._collect_diff_context",
+          "kind": "function",
+          "line": 379,
+          "score": 0.6827729344367981
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/temporal/surface.py",
+          "qualname": "_resolve_code_review_agent_context",
+          "kind": "function",
+          "line": 125,
+          "score": 0.608649730682373
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "ReviewContextService._collect_target_context",
+          "kind": "function",
+          "line": 589,
+          "score": 0.5917540192604065
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/code_context.py",
+          "qualname": "FileContextAnalyzer",
+          "kind": "class",
+          "line": 208,
+          "score": 0.5901875495910645
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/context.py",
+          "qualname": "_resolve_context_source",
+          "kind": "function",
+          "line": 718,
+          "score": 0.5743187665939331
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/code_context.py",
+          "qualname": "merge_changed_ranges",
+          "kind": "function",
+          "line": 187,
+          "score": 0.524864912033081
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_workers.py",
+          "qualname": "_context_slice",
+          "kind": "function",
+          "line": 1863,
+          "score": 0.4826909601688385
+        }
+      ]
+    },
+    {
+      "id": "atlas-24-reuse-refuted-findings",
+      "issue_iid": 24,
+      "issue_title": "Не проверять заново неизменные опровергнутые findings",
+      "query": "Хочу сохранять отрицательную оценку finding и пропускать повторный confirmation, если region, content и task context не изменились, а при изменении запускать revalidation. Где уже строится такой план reuse versus revalidation для known findings?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+        "qualname": "plan_known_finding_reuse"
+      },
+      "rationale": "This planner compares structural identity, content, regions, and task context to decide reuse versus revalidation.",
+      "rank": 2,
+      "latency_seconds": 3.9014929169788957,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+          "qualname": "KnownFindingReusePlan",
+          "kind": "class",
+          "line": 140,
+          "score": 0.9971362352371216
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+          "qualname": "plan_known_finding_reuse",
+          "kind": "function",
+          "line": 202,
+          "score": 0.9965611100196838
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+          "qualname": "KnownFindingRevalidation",
+          "kind": "class",
+          "line": 128,
+          "score": 0.9947205781936646
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/known_finding_revalidation.py",
+          "qualname": "KnownFindingRevalidationExecution",
+          "kind": "class",
+          "line": 42,
+          "score": 0.9883544445037842
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/known_finding_revalidation.py",
+          "qualname": "_revalidate_known_finding",
+          "kind": "function",
+          "line": 238,
+          "score": 0.9858928322792053
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+          "qualname": "KnownFindingRevalidationContext",
+          "kind": "class",
+          "line": 32,
+          "score": 0.9858285188674927
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_finding_reconciliation.py",
+          "qualname": "_finding",
+          "kind": "function",
+          "line": 98,
+          "score": 0.9806678295135498
+        },
+        {
+          "path": "tests/pipelines/code_review/re_review_memory/test_service.py",
+          "qualname": "_confirmed_finding",
+          "kind": "function",
+          "line": 1403,
+          "score": 0.9779990911483765
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/known_finding_revalidation.py",
+          "qualname": "execute_known_finding_revalidation",
+          "kind": "function",
+          "line": 53,
+          "score": 0.9740038514137268
+        },
+        {
+          "path": "tests/pipelines/code_review/re_review_memory/test_service.py",
+          "qualname": "_known_finding_snapshot",
+          "kind": "function",
+          "line": 1437,
+          "score": 0.9727368354797363
+        }
+      ]
+    },
+    {
+      "id": "atlas-120-known-finding-revalidation",
+      "issue_iid": 120,
+      "issue_title": "Изучить и убрать revalidation известных находок перед публикацией",
+      "query": "Хочу убрать fresh model revalidation известных findings перед publication. Найдите существующий orchestration path, который делает fan-out revalidation, разделяет retained, fixed и needs-investigation и собирает metrics, чтобы менять его, а не создавать новый слой.",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/services/review_hypothesis/known_finding_revalidation.py",
+        "qualname": "execute_known_finding_revalidation"
+      },
+      "rationale": "This is the end-to-end orchestration boundary for known-finding revalidation and its metrics.",
+      "rank": 3,
+      "latency_seconds": 19.856636708136648,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+          "qualname": "KnownFindingRevalidation",
+          "kind": "class",
+          "line": 128,
+          "score": 0.9902890920639038
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/known_finding_revalidation.py",
+          "qualname": "KnownFindingRevalidationExecution",
+          "kind": "class",
+          "line": 42,
+          "score": 0.9854564070701599
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/known_finding_revalidation.py",
+          "qualname": "execute_known_finding_revalidation",
+          "kind": "function",
+          "line": 53,
+          "score": 0.9832661151885986
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/known_finding_revalidation.py",
+          "qualname": "_revalidate_known_finding",
+          "kind": "function",
+          "line": 238,
+          "score": 0.9767106175422668
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+          "qualname": "KnownFindingRevalidationContext",
+          "kind": "class",
+          "line": 32,
+          "score": 0.9684379696846008
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/known_finding_revalidation.py",
+          "qualname": "_revalidate_known_finding_outcome",
+          "kind": "function",
+          "line": 155,
+          "score": 0.9636797904968262
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+          "qualname": "KnownFindingRevalidationResponse",
+          "kind": "class",
+          "line": 54,
+          "score": 0.9429610371589661
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+          "qualname": "KnownFindingReuseMetrics",
+          "kind": "class",
+          "line": 83,
+          "score": 0.9348832964897156
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_hypothesis_stage.py",
+          "qualname": "_RevalidationExecutor",
+          "kind": "class",
+          "line": 884,
+          "score": 0.9218751192092896
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/known_findings.py",
+          "qualname": "build_known_finding_revalidation_messages",
+          "kind": "function",
+          "line": 145,
+          "score": 0.8955397605895996
+        }
+      ]
+    },
+    {
+      "id": "atlas-123-unified-known-finding-recall",
+      "issue_iid": 123,
+      "issue_title": "Объединить per-MR память ре-ранов и repo-level память в одну концепцию «известный finding»",
+      "query": "Объединяю per-MR prior reports и repo-level memory в один recall. Где уже есть bounded отбор кандидатов по той же локации и пересечению code identifiers, который можно расширить дополнительным scope?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/services/review_finding_reconciliation.py",
+        "qualname": "select_prior_report_candidates"
+      },
+      "rationale": "This selector combines bounded location and lexical channels and deduplicates candidates.",
+      "rank": 1,
+      "latency_seconds": 11.95520249987021,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_finding_reconciliation.py",
+          "qualname": "select_prior_report_candidates",
+          "kind": "function",
+          "line": 478,
+          "score": 0.9946560859680176
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_prior_reports.py",
+          "qualname": "PriorReportReply",
+          "kind": "class",
+          "line": 18,
+          "score": 0.9647272229194641
+        },
+        {
+          "path": "src/atlas/review_feedback/domain.py",
+          "qualname": "HumanDecisionCandidate",
+          "kind": "class",
+          "line": 78,
+          "score": 0.9417121410369873
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/repository.py",
+          "qualname": "ReReviewMemoryRepository",
+          "kind": "class",
+          "line": 23,
+          "score": 0.9392759799957275
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_model_inputs.py",
+          "qualname": "ReviewModelInputBuilderService._prior_report_relevance",
+          "kind": "function",
+          "line": 890,
+          "score": 0.9370002150535583
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_prior_reports.py",
+          "qualname": "build_prior_robot_reports",
+          "kind": "function",
+          "line": 97,
+          "score": 0.9219263792037964
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/planning/investigations.py",
+          "qualname": "materialize_candidates",
+          "kind": "function",
+          "line": 55,
+          "score": 0.9209122657775879
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_model_inputs.py",
+          "qualname": "ReviewModelInputBuilderService._build_prior_report_hints",
+          "kind": "function",
+          "line": 847,
+          "score": 0.915560781955719
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_prior_reports.py",
+          "qualname": "reports_match",
+          "kind": "function",
+          "line": 167,
+          "score": 0.9132277965545654
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_prior_reports.py",
+          "qualname": "PriorRobotReport",
+          "kind": "class",
+          "line": 26,
+          "score": 0.9094374179840088
+        }
+      ]
+    },
+    {
+      "id": "atlas-79-prompt-cache-finalization",
+      "issue_iid": 79,
+      "issue_title": "Сохранять prompt cache при финализации review",
+      "query": "Нужно сохранить общий provider prompt prefix между tool loop и structured final answer и не дублировать tool schemas. Где формируется отдельный finalization model turn после finish signal?",
+      "expected": {
+        "path": "src/atlas/agent_runtime/runtime/model_turns/tool_loop_turn.py",
+        "qualname": "ToolLoopTurnRunner._finalize_via_response_format"
+      },
+      "rationale": "This method turns the accepted finish signal into the separate structured finalization call.",
+      "rank": null,
+      "latency_seconds": 17.227495125029236,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/agent_runtime/runtime/model_turns/validation.py",
+          "qualname": "ToolLoopFinish",
+          "kind": "class",
+          "line": 19,
+          "score": 0.96724933385849
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/messages.py",
+          "qualname": "FinishSignal",
+          "kind": "class",
+          "line": 56,
+          "score": 0.9620998501777649
+        },
+        {
+          "path": "src/atlas/agent_runtime/model_execution.py",
+          "qualname": "AgentModelExecution.build_finalization_message",
+          "kind": "function",
+          "line": 117,
+          "score": 0.921330988407135
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/model_turns/tool_loop_turn.py",
+          "qualname": "ToolLoopTurnRunner",
+          "kind": "class",
+          "line": 77,
+          "score": 0.9200244545936584
+        },
+        {
+          "path": "tests/agent_runtime/test_model_execution.py",
+          "qualname": "test_native_model_execution_rejects_content_only_final_output.run_tool_turn",
+          "kind": "function",
+          "line": 263,
+          "score": 0.8239870071411133
+        },
+        {
+          "path": "tests/agent_runtime/test_model_execution.py",
+          "qualname": "test_model_execution_uses_structured_output_for_final_only_turn.run_structured_turn",
+          "kind": "function",
+          "line": 314,
+          "score": 0.7862504124641418
+        },
+        {
+          "path": "src/atlas/agent_runtime/temporal/model_gateway.py",
+          "qualname": "ModelTurnExecutor.run_structured_turn",
+          "kind": "function",
+          "line": 40,
+          "score": 0.7829120755195618
+        },
+        {
+          "path": "src/atlas/agent_runtime/temporal/model_gateway.py",
+          "qualname": "TemporalModelTurnExecutor.run_structured_turn",
+          "kind": "function",
+          "line": 115,
+          "score": 0.7829120755195618
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/protocols.py",
+          "qualname": "NativeToolLoopProtocol.strict_tool_schema_mode",
+          "kind": "function",
+          "line": 94,
+          "score": 0.758633553981781
+        },
+        {
+          "path": "tests/agent_runtime/temporal/test_agent_runtime_temporal_activities.py",
+          "qualname": "test_run_tool_model_turn_activity_finalizes_signal_finish_via_response_format",
+          "kind": "function",
+          "line": 2564,
+          "score": 0.7552028894424438
+        }
+      ]
+    },
+    {
+      "id": "atlas-90-investigation-search-order",
+      "issue_iid": 90,
+      "issue_title": "Сократить лишний поиск evidence в investigation",
+      "query": "Хочу изменить порядок investigation: changed behavior, затем enclosing contract, затем только decisive caller, guard или test; broad search — лишь для конкретного unresolved question. Где собрана системная инструкция и описаны repository tools для investigator?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/prompts/review_workers.py",
+        "qualname": "build_investigation_messages"
+      },
+      "rationale": "This builder contains the investigator system instruction and repository-tool guidance.",
+      "rank": 9,
+      "latency_seconds": 3.7260095002129674,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/frontend_views.py",
+          "qualname": "CodeReviewRunViewAdapter._investigation_task_stage",
+          "kind": "function",
+          "line": 523,
+          "score": 0.9455385208129883
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_hypothesis/planning/investigations.py",
+          "qualname": "build_investigation_units",
+          "kind": "function",
+          "line": 135,
+          "score": 0.8756770491600037
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_agent_tasks.py",
+          "qualname": "ReviewAgentTaskBuilderService.build_investigation_task_spec",
+          "kind": "function",
+          "line": 333,
+          "score": 0.8121429085731506
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/temporal/unit_workflows.py",
+          "qualname": "InvestigationUnitWorkflow",
+          "kind": "class",
+          "line": 80,
+          "score": 0.7843491435050964
+        },
+        {
+          "path": "tests/pipelines/code_review/services/test_review_workers.py",
+          "qualname": "_investigation_unit",
+          "kind": "function",
+          "line": 1811,
+          "score": 0.7699102759361267
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_model_inputs.py",
+          "qualname": "ReviewModelInputBuilderService._build_investigation_input",
+          "kind": "function",
+          "line": 537,
+          "score": 0.745058000087738
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/services/review_model_inputs.py",
+          "qualname": "ReviewModelInputBuilderService.build_investigation_inputs",
+          "kind": "function",
+          "line": 427,
+          "score": 0.7250849008560181
+        },
+        {
+          "path": "tests/pipelines/code_review/temporal/test_code_review_temporal_workflows.py",
+          "qualname": "_run_investigation_agent_runtime_call",
+          "kind": "function",
+          "line": 250,
+          "score": 0.7007800936698914
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/prompts/review_workers.py",
+          "qualname": "build_investigation_messages",
+          "kind": "function",
+          "line": 372,
+          "score": 0.6878761649131775
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/temporal/stage_definitions.py",
+          "qualname": "InvestigationPreparePolicy",
+          "kind": "class",
+          "line": 587,
+          "score": 0.6698906421661377
+        }
+      ]
+    },
+    {
+      "id": "atlas-30-single-retry-owner",
+      "issue_iid": 30,
+      "issue_title": "Оставить один retry-владелец для каждой ошибки model/tool вызова",
+      "query": "Нужно прекратить semantic repair для auth, cancellation и exhausted transport failures, но оставить его для исправимых schema/invalid-response ошибок. Есть ли общий classifier model-client errors, который надо использовать вместо новой retry policy?",
+      "expected": {
+        "path": "src/atlas/agent_runtime/model_execution.py",
+        "qualname": "classify_model_client_error_for_repair"
+      },
+      "rationale": "This is the shared model-client error classifier used to decide whether semantic repair is allowed.",
+      "rank": 1,
+      "latency_seconds": 19.906489958055317,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/agent_runtime/model_execution.py",
+          "qualname": "classify_model_client_error_for_repair",
+          "kind": "function",
+          "line": 231,
+          "score": 0.9987970590591431
+        },
+        {
+          "path": "src/atlas/llm/errors.py",
+          "qualname": "ModelClientErrorKind",
+          "kind": "class",
+          "line": 14,
+          "score": 0.9943846464157104
+        },
+        {
+          "path": "tests/agent_runtime/test_repair.py",
+          "qualname": "_classify_tool_turn_error",
+          "kind": "function",
+          "line": 624,
+          "score": 0.9931168556213379
+        },
+        {
+          "path": "src/atlas/agent_runtime/runtime/repair.py",
+          "qualname": "_repair_failure_details",
+          "kind": "function",
+          "line": 199,
+          "score": 0.9921938180923462
+        },
+        {
+          "path": "src/atlas/agent_runtime/model_execution.py",
+          "qualname": "AgentModelExecution.classify_repair_failure",
+          "kind": "function",
+          "line": 192,
+          "score": 0.9866322875022888
+        },
+        {
+          "path": "src/atlas/llm/error_classification.py",
+          "qualname": "classify_model_exception",
+          "kind": "function",
+          "line": 33,
+          "score": 0.984357476234436
+        },
+        {
+          "path": "tests/agent_runtime/test_repair.py",
+          "qualname": "_classify_final_output_error",
+          "kind": "function",
+          "line": 631,
+          "score": 0.9803823232650757
+        },
+        {
+          "path": "src/atlas/llm/vector_client.py",
+          "qualname": "_invalid_response",
+          "kind": "function",
+          "line": 191,
+          "score": 0.9794865846633911
+        },
+        {
+          "path": "tests/agent_runtime/test_repair.py",
+          "qualname": "test_transport_exhaustion_does_not_start_semantic_repair",
+          "kind": "function",
+          "line": 746,
+          "score": 0.976200520992279
+        },
+        {
+          "path": "src/atlas/agent_runtime/model_execution.py",
+          "qualname": "_classify_invalid_response_error",
+          "kind": "function",
+          "line": 248,
+          "score": 0.9717934131622314
+        }
+      ]
+    },
+    {
+      "id": "atlas-125-embedding-instruction-calibration",
+      "issue_iid": 125,
+      "issue_title": "Память ревью: калибровка инструкций эмбеддинга (asymmetric retrieval qwen3-embedding)",
+      "query": "Хочу сравнить симметричные и асимметричные инструкции для embedding прошлой находки и текущего finding, затем версионировать выбранную пару. Где единая граница, которая формирует document и query embedding requests для review memory?",
+      "expected": {
+        "path": "src/atlas/pipelines/code_review/memory/router.py",
+        "qualname": "MemoryRouterClient._embed"
+      },
+      "rationale": "This private boundary formats and sends both document and query embedding requests for review memory.",
+      "rank": 10,
+      "latency_seconds": 8.895976333413273,
+      "warnings": [],
+      "results": [
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/service.py",
+          "qualname": "ReReviewMemoryService",
+          "kind": "class",
+          "line": 63,
+          "score": 0.9603621959686279
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/memory/domain.py",
+          "qualname": "MemoryFactEmbedding",
+          "kind": "class",
+          "line": 113,
+          "score": 0.930166482925415
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/memory/router.py",
+          "qualname": "embedding_instruction_hash",
+          "kind": "function",
+          "line": 164,
+          "score": 0.921371340751648
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/domain.py",
+          "qualname": "ReReviewMemoryPayload",
+          "kind": "class",
+          "line": 89,
+          "score": 0.9199067950248718
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/re_review_memory/domain.py",
+          "qualname": "ReReviewMemorySnapshot",
+          "kind": "class",
+          "line": 97,
+          "score": 0.8820555806159973
+        },
+        {
+          "path": "tests/pipelines/code_review/memory/test_router.py",
+          "qualname": "test_router_keeps_document_and_query_instructions_separate",
+          "kind": "function",
+          "line": 83,
+          "score": 0.8776403665542603
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/prompts/confirmation_verification.py",
+          "qualname": "_memory_instruction",
+          "kind": "function",
+          "line": 184,
+          "score": 0.855460524559021
+        },
+        {
+          "path": "src/atlas/agent_runtime/temporal/model_gateway.py",
+          "qualname": "TemporalModelVectorExecutor.run_embedding",
+          "kind": "function",
+          "line": 143,
+          "score": 0.8520898222923279
+        },
+        {
+          "path": "src/atlas/llm/vector_client.py",
+          "qualname": "ModelVectorClient.embed",
+          "kind": "function",
+          "line": 57,
+          "score": 0.8477091789245605
+        },
+        {
+          "path": "src/atlas/pipelines/code_review/memory/router.py",
+          "qualname": "MemoryRouterClient._embed",
+          "kind": "function",
+          "line": 106,
+          "score": 0.8365761041641235
+        }
+      ]
+    }
+  ]
+}
