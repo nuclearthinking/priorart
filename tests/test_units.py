@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import struct
 import subprocess
 from pathlib import Path
 
@@ -522,3 +523,135 @@ def test_index_line_flags_parse_problems_not_clean_empties():
 
     assert "parse issues: 2 embed_failed, 1 partial" in line
     assert "empty" not in line
+
+
+def _expand_db(tmp_path, files):
+    conn = connect(tmp_path / "expand.db", embed_dim=4)
+    conn.execute("INSERT INTO repos (repo, head, indexed_at) VALUES ('r', NULL, NULL)")
+    ids = {}
+    for path, symbols in files.items():
+        for order, (qualname, body, vector) in enumerate(symbols, 1):
+            cur = conn.execute(
+                "INSERT INTO symbols (repo, path, name, qualname, kind, lang, line, end_line, "
+                "signature, full_signature, docstring, body, search_text, embed_text) "
+                "VALUES ('r', ?, ?, ?, 'function', 'python', ?, ?, '', ?, '', ?, ?, ?)",
+                (path, qualname, qualname, order, order + 1, qualname, body, qualname, qualname),
+            )
+            ids[(path, qualname)] = cur.lastrowid
+            if vector is not None:
+                conn.execute(
+                    "INSERT INTO symbols_vec (symbol_id, repo, embedding) VALUES (?, 'r', ?)",
+                    (cur.lastrowid, vector),
+                )
+    conn.commit()
+    return conn, ids
+
+
+def _vec4(*values):
+    return struct.pack("4f", *values)
+
+
+def test_expand_pool_ranks_term_hits_before_cosine(tmp_path):
+    from priorart.search import _expand_pool
+
+    query_vector = _vec4(1.0, 0.0, 0.0, 0.0)
+    conn, ids = _expand_db(
+        tmp_path,
+        {
+            "a.py": [
+                ("pool_hit", "def pool_hit(): pass", None),
+                ("term_owner", "INSERT INTO events ON CONFLICT", _vec4(0.0, 1.0, 0.0, 0.0)),
+                ("cosy_neighbour", "def cosy_neighbour(): pass", _vec4(1.0, 0.0, 0.0, 0.0)),
+            ]
+        },
+    )
+    pool = [(ids[("a.py", "pool_hit")], 0.9)]
+
+    expanded = _expand_pool(conn, "r", "сделать INSERT ON CONFLICT", query_vector, pool)
+
+    assert next(row[3] for _sid, row in expanded) == "term_owner"
+
+
+def test_expand_pool_breaks_ties_by_cosine(tmp_path):
+    from priorart.search import _expand_pool
+
+    query_vector = _vec4(1.0, 0.0, 0.0, 0.0)
+    conn, ids = _expand_db(
+        tmp_path,
+        {
+            "a.py": [
+                ("pool_hit", "def pool_hit(): pass", None),
+                ("aligned", "INSERT INTO events", _vec4(0.9, 0.1, 0.0, 0.0)),
+                ("orthogonal", "INSERT INTO logs", _vec4(0.0, 0.9, 0.1, 0.0)),
+            ]
+        },
+    )
+    pool = [(ids[("a.py", "pool_hit")], 0.9)]
+
+    expanded = _expand_pool(conn, "r", "INSERT", query_vector, pool)
+
+    assert [row[3] for _sid, row in expanded] == ["aligned", "orthogonal"]
+
+
+def test_expand_pool_respects_file_quota_order_and_limit(tmp_path):
+    from priorart.search import EXPANSION_FILE_QUOTA, EXPANSION_LIMIT, _expand_pool
+
+    files = {}
+    for index in range(20):
+        files[f"f{index:02}.py"] = [("sibling", f"def s{index}(): pass", None) for _ in range(5)]
+    conn, ids = _expand_db(tmp_path, files)
+    top = [(ids[(f"f{index:02}.py", "sibling")], 0.9 - index * 0.01) for index in range(20)]
+
+    expanded = _expand_pool(conn, "r", "anything", None, top)
+
+    per_file = {}
+    for _sid, row in expanded:
+        per_file[row[1]] = per_file.get(row[1], 0) + 1
+    assert len(expanded) == EXPANSION_LIMIT
+    assert all(count == EXPANSION_FILE_QUOTA for count in list(per_file.values())[:-1])
+    assert list(per_file.values())[-1] == 2
+    assert set(per_file) == {f"f{index:02}.py" for index in range(17)}
+
+
+def test_expand_pool_ignores_files_without_fused_symbols(tmp_path):
+    from priorart.search import _expand_pool
+
+    conn, ids = _expand_db(
+        tmp_path,
+        {
+            "found.py": [("pool_hit", "def pool_hit(): pass", None)],
+            "unfound.py": [("loner", "INSERT INTO events", None)],
+        },
+    )
+    pool = [(ids[("found.py", "pool_hit")], 0.9)]
+
+    expanded = _expand_pool(conn, "r", "INSERT", None, pool)
+
+    assert expanded == []
+
+
+def test_search_pool_expansion_adds_owner_and_can_be_disabled(tmp_path):
+    conn, ids = _expand_db(
+        tmp_path,
+        {
+            "a.py": [
+                ("widget_keeper", "def keeper(): pass", None),
+                ("owner", "widget_factory = register(widget)", None),
+            ]
+        },
+    )
+    conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'a.py', 0, 0)")
+    conn.commit()
+
+    from priorart.search import search
+
+    with_expansion = search(conn, "r", "widget", k=10, pool_expansion=True)
+    assert [candidate.qualname for candidate in with_expansion.candidates] == [
+        "widget_keeper",
+        "owner",
+    ]
+    assert with_expansion.trace.expansion == [ids[("a.py", "owner")]]
+
+    without_expansion = search(conn, "r", "widget", k=10, pool_expansion=False)
+    assert [candidate.qualname for candidate in without_expansion.candidates] == ["widget_keeper"]
+    assert without_expansion.trace.expansion == []

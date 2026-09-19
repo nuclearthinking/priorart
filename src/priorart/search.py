@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 import time
+from array import array
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -12,6 +13,8 @@ CANDIDATE_LIMIT = 50
 RRF_K = 60
 RERANK_DOCUMENT_FORMAT = "path-qualname-kind-signature-docstring-body-v1"
 BODY_MAX_CHARS = 3000
+EXPANSION_LIMIT = 50
+EXPANSION_FILE_QUOTA = 3
 
 # "empty" is a clean parse of a symbol-free file, not a problem; "embed_failed"
 # leaves stale symbols behind and must stay visible.
@@ -42,6 +45,7 @@ class SearchTrace:
     vec_rankings: list[list[int]]
     fused: list[tuple[int, float]]
     rerank_order: list[int] | None
+    expansion: list[int] | None = None
 
 
 @dataclass
@@ -94,6 +98,8 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
     expand_fn=None,
     embed_fn=None,
     rerank_fn=None,
+    *,
+    pool_expansion: bool = True,
 ) -> SearchReport:
     warnings: list[str] = []
     stage_seconds: dict[str, float] = {}
@@ -115,6 +121,11 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
             : max(CANDIDATE_LIMIT, k)
         ]
         rows = _fetch(conn, [symbol_id for symbol_id, _ in top], repo)
+        expansion = (
+            _expand_pool(conn, repo, query, query_vectors[0] if query_vectors else None, top)
+            if pool_expansion
+            else []
+        )
         head, indexed_at = _repo_meta(conn, repo)
         symbol_count = conn.execute(
             "SELECT COUNT(*) FROM symbols WHERE repo = ?", (repo,)
@@ -154,6 +165,7 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
                 ),
             )
         )
+    pool.extend((symbol_id, _candidate_from_row(row, 0.0)) for symbol_id, row in expansion)
     started = time.perf_counter()
     candidates, rerank_indices = _apply_rerank(
         [candidate for _symbol_id, candidate in pool], query, rerank_fn, warnings
@@ -178,6 +190,7 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
             vec_rankings=vec_rankings,
             fused=list(top),
             rerank_order=rerank_order,
+            expansion=[symbol_id for symbol_id, _ in expansion],
         ),
         parse_coverage=parse_coverage,
     )
@@ -231,6 +244,138 @@ def _rerank_document(candidate: Candidate) -> str:
     header = f"{candidate.path} :: {candidate.qualname} ({candidate.kind})"
     body = bounded_body(candidate.body)
     return f"{header}\n{candidate.full_signature}\n{candidate.docstring}\n{body}"
+
+
+def _candidate_from_row(row: tuple, score: float) -> Candidate:
+    return Candidate(
+        path=row[1],
+        name=row[2],
+        qualname=row[3],
+        kind=row[4],
+        lang=row[5],
+        line=row[6],
+        end_line=row[7],
+        signature=row[8],
+        full_signature=row[9],
+        docstring=row[10],
+        body=row[11],
+        score=score,
+    )
+
+
+def _expand_pool(conn, repo, query, query_vector, top) -> list[tuple[int, tuple]]:
+    """Add suitable owners from files the fused ranking already found.
+
+    A file with symbols in the candidate pool is "found"; its remaining
+    definitions can still be the queried owner even when they never made any
+    per-stage top list. Per file, at most EXPANSION_FILE_QUOTA symbols are
+    added, ranked by distinct query terms matched in the body (prefix,
+    case-insensitive) with cosine similarity to the query as tie-breaker;
+    files are considered in order of their best fused score until
+    EXPANSION_LIMIT symbols are added in total.
+    """
+    pool_ids = {symbol_id for symbol_id, _score in top}
+    terms = _query_terms(query)
+    files = _file_order(conn, dict(top))
+    expanded: list[tuple[int, tuple]] = []
+    seen: set[int] = set()
+    for path in files:
+        if len(expanded) >= EXPANSION_LIMIT:
+            break
+        quota = min(EXPANSION_FILE_QUOTA, EXPANSION_LIMIT - len(expanded))
+        for symbol_id, row in _file_expansions(
+            conn, repo, path, pool_ids | seen, terms, query_vector
+        )[:quota]:
+            expanded.append((symbol_id, row))
+            seen.add(symbol_id)
+    return expanded
+
+
+def _file_order(conn, pool) -> list[str]:
+    """Files of the pooled symbols, strongest symbol first."""
+    paths: dict[int, str] = {}
+    symbol_ids = list(pool)
+    for start in range(0, len(symbol_ids), 500):
+        chunk = symbol_ids[start : start + 500]
+        marks = ",".join("?" * len(chunk))
+        paths.update(
+            dict(
+                conn.execute(
+                    f"SELECT id, path FROM symbols WHERE id IN ({marks})",  # noqa: S608 - marks are placeholders only
+                    chunk,
+                )
+            )
+        )
+    best: dict[str, float] = {}
+    for symbol_id, score in pool.items():
+        path = paths.get(symbol_id)
+        if path is not None and score > best.get(path, 0.0):
+            best[path] = score
+    return [path for path, _score in sorted(best.items(), key=lambda item: item[1], reverse=True)]
+
+
+def _file_expansions(  # noqa: PLR0913, PLR0917 - same explicit-collaborator shape as search()
+    conn, repo, path, exclude, terms, query_vector
+) -> list[tuple[int, tuple]]:
+    rows = [
+        row
+        for row in conn.execute(
+            f"SELECT {_COLUMNS} FROM symbols WHERE repo = ? AND path = ?",  # noqa: S608 - _COLUMNS is a fixed column list
+            (repo, path),
+        )
+        if row[0] not in exclude
+    ]
+    if not rows:
+        return []
+    embeddings = _embeddings(conn, [row[0] for row in rows])
+    ranked = sorted(
+        rows,
+        key=lambda row: (
+            _term_hits(row[11], terms),
+            _cosine(embeddings.get(row[0]), query_vector),
+        ),
+        reverse=True,
+    )
+    return [(row[0], row) for row in ranked]
+
+
+def _query_terms(query: str) -> list[str]:
+    terms: dict[str, None] = {}
+    for term in re.findall(r"\w{3,}", query.lower()):
+        terms.setdefault(term)
+    return list(terms)
+
+
+def _term_hits(body: str | None, terms: list[str]) -> int:
+    if not body or not terms:
+        return 0
+    low = body.lower()
+    return sum(1 for term in terms if re.search(rf"\b{re.escape(term)}", low))
+
+
+def _embeddings(conn, symbol_ids: list[int]) -> dict[int, bytes]:
+    if not symbol_ids:
+        return {}
+    marks = ",".join("?" * len(symbol_ids))
+    return {
+        row[0]: row[1]
+        for row in conn.execute(
+            f"SELECT symbol_id, embedding FROM symbols_vec WHERE symbol_id IN ({marks})",  # noqa: S608 - marks are placeholders only
+            symbol_ids,
+        )
+    }
+
+
+def _cosine(embedding: bytes | None, query_vector: bytes | None) -> float:
+    if embedding is None or query_vector is None:
+        return 0.0
+    left = array("f")
+    left.frombytes(embedding)
+    right = array("f")
+    right.frombytes(query_vector)
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    norm = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
+    return dot / norm if norm else 0.0
 
 
 def _apply_rerank(candidates, query, rerank_fn, warnings) -> tuple[list, list[int] | None]:

@@ -74,11 +74,17 @@ class Obfuscator:
     """Applies a private term-to-placeholder vocabulary to strings and JSON."""
 
     def __init__(self, replacements: dict[str, str]) -> None:
-        # Adjacent alphanumerics block a match, so words merely containing a
-        # term stay untouched while hyphenated ids, paths, and UPPER_SNAKE
-        # identifiers are replaced.
+        # Adjacent lowercase alphanumerics block a match, so words merely
+        # containing a term stay untouched while hyphenated ids, paths,
+        # UPPER_SNAKE, and CamelCase identifiers are replaced. The boundary
+        # classes are case-sensitive (scoped (?-i:) flags) so an uppercase
+        # letter next to the term still counts as a CamelCase boundary.
+        boundary = r"(?-i:[a-z0-9])"
         self._patterns = {
-            re.compile(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", re.IGNORECASE): placeholder
+            re.compile(
+                rf"(?<!{boundary}){re.escape(term)}(?!{boundary})",
+                re.IGNORECASE,
+            ): placeholder
             for term, placeholder in replacements.items()
         }
 

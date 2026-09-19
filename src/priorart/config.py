@@ -43,6 +43,10 @@ class Config(BaseSettings):
     )
     rerank_model: str = Field(default="", description="Reranker model id sent to the provider")
     llm_model: str = Field(default="", description="LLM model id sent to the provider")
+    pool_expansion: bool = Field(
+        default=True,
+        description="Add suitable owner symbols from files the fused ranking found to the rerank pool",
+    )
     db_path: Path = Field(
         default=Path.home() / ".priorart" / "index.db",
         validation_alias="PRIORART_DB",

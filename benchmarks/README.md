@@ -28,23 +28,24 @@ without query warnings.
 | 3 · observability, traces + pool artifact | 2026-09-19 | 0.70 | 0.458 | 3.7 s | 16.3 s | 2 partial-parse |
 | 4 · locator rerank documents | 2026-09-19 | 0.80 | 0.593 | 4.0 s | 19.0 s | 2 partial-parse |
 | 5 · body rerank documents | 2026-09-19 | 0.85 | 0.806 | 6.7 s | 16.8 s | 2 partial-parse |
+| 6 · pool expansion (file → owner) | 2026-09-19 | **0.95** | 0.814 | 13.5 s | 19.5 s | 2 partial-parse |
 
 ```mermaid
 xychart-beta
     title "Retrieval quality by iteration (upper: Recall@10, lower: MRR@10)"
-    x-axis ["baseline", "hardened", "pool", "locator", "body"]
-    y-axis "score" 0 --> 0.9
-    bar [0.70, 0.70, 0.70, 0.80, 0.85]
-    bar [0.457, 0.458, 0.458, 0.593, 0.806]
+    x-axis ["baseline", "hardened", "pool", "locator", "body", "expansion"]
+    y-axis "score" 0 --> 1
+    bar [0.70, 0.70, 0.70, 0.80, 0.85, 0.95]
+    bar [0.457, 0.458, 0.458, 0.593, 0.806, 0.814]
 ```
 
 ```mermaid
 xychart-beta
     title "Query latency by iteration (upper: p95, lower: p50, seconds)"
-    x-axis ["baseline", "hardened", "pool", "locator", "body"]
+    x-axis ["baseline", "hardened", "pool", "locator", "body", "expansion"]
     y-axis "seconds" 0 --> 22
-    bar [8.9, 9.1, 3.7, 4.0, 6.7]
-    bar [19.9, 17.3, 16.3, 19.0, 16.8]
+    bar [8.9, 9.1, 3.7, 4.0, 6.7, 13.5]
+    bar [19.9, 17.3, 16.3, 19.0, 16.8, 19.5]
 ```
 
 **Iteration 1 — first full measurement.** The hybrid pipeline with remote
@@ -135,6 +136,28 @@ extracted from.
 Full per-case detail (top-50 candidates per query, traces, warnings,
 latency) is in the result files in [`results/`](results/).
 
+**Iteration 6 — pool expansion (file → owner).** A fresh control run of the
+iteration-5 configuration reproduced 0.85/0.808 (same three losses: one cut at
+fusion, one never retrieved, one ranked deep). Pool expansion then adds up to
+50 further candidates: files of the fused top-50 pool are considered in order
+of their best fused score, and per file at most 3 symbols missing from the
+pool join it, ranked by distinct query terms matched in the body (prefix,
+case-insensitive) with cosine similarity to the query as tie-breaker. Both
+pool-absent golds entered via expansion and hit: the canonicalizer at rank 1
+(its file's other symbols were already pooled while the owner itself never
+made any per-stage top list) and the idempotent-insert owner at rank 7
+(selected on body terms its signature does not carry). A third gold also
+arrived via expansion at rank 1. Recall 0.85 → **0.95** (19/20, the rerank
+ceiling now: the only remaining miss ranks 14th); four cases shifted by 1–2
+positions, inside the established rerank noise bound. The rerank pool doubles
+(50 → up to 100 documents), so query latency roughly doubles (p50 6.5 →
+13.5 s, p95 18.1 → 19.5 s) — the quality gain pays for it. Expansion is on
+by product default (`PRIORART_POOL_EXPANSION=false` disables it;
+`--no-pool-expansion` is the benchmark control flag) and the trace records
+the added symbol ids. The `remote-qwen3-8b-body-control` and
+`remote-qwen3-8b-pool-expansion` artifacts were produced back to back on the
+same index and model stack.
+
 ## Suite format
 
 ```json
@@ -173,7 +196,9 @@ model-specific ignored SQLite database, unless `PRIORART_DB` is set.
 
 The reported metrics are recall@k, MRR@k, p50/p95 query latency, total query
 time, and warning count. The first 50 reranked candidates are retained for
-failure analysis while the default quality cutoff remains ten.
+failure analysis while the default quality cutoff remains ten. Pool expansion
+(product default) can be disabled for control runs with `--no-pool-expansion`;
+the manifest records the expansion settings either way.
 
 ### Replay an A/B experiment
 

@@ -29,6 +29,8 @@ from priorart.runtime import Runtime
 from priorart.search import (
     BODY_MAX_CHARS,
     CANDIDATE_LIMIT,
+    EXPANSION_FILE_QUOTA,
+    EXPANSION_LIMIT,
     RERANK_DOCUMENT_FORMAT,
     RRF_K,
     _valid_rerank,
@@ -102,14 +104,16 @@ def path_rank(results: list[dict], expected: dict) -> int | None:
 def loss_stage(gold_id: int, trace, rank: int | None, k: int) -> str | None:
     if rank is not None and rank <= k:
         return None
-    retrieved = any(gold_id in ranking for ranking in (*trace.fts_rankings, *trace.vec_rankings))
-    if not retrieved:
-        return "not_retrieved"
-    if gold_id not in {symbol_id for symbol_id, _score in trace.fused}:
+    in_pool = gold_id in {symbol_id for symbol_id, _score in trace.fused} or gold_id in (
+        trace.expansion or ()
+    )
+    if in_pool:
+        if rank is None:
+            return "not_fetched"
+        return "ranked_deep"
+    if any(gold_id in ranking for ranking in (*trace.fts_rankings, *trace.vec_rankings)):
         return "pool_cutoff"
-    if rank is None:
-        return "not_fetched"
-    return "ranked_deep"
+    return "not_retrieved"
 
 
 def retrieved_by(gold_id: int, trace) -> list[str]:
@@ -118,6 +122,8 @@ def retrieved_by(gold_id: int, trace) -> list[str]:
         sources.append("fts")
     if any(gold_id in ranking for ranking in trace.vec_rankings):
         sources.append("dense")
+    if gold_id in (trace.expansion or ()):
+        sources.append("expansion")
     return sources
 
 
@@ -230,6 +236,8 @@ def _run_benchmark(args) -> dict:
     if "PRIORART_DB" not in os.environ:
         model_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", embed_model)
         os.environ["PRIORART_DB"] = str(ROOT / ".bench" / f"index-{model_key}-{embed_dim}.db")
+    if args.no_pool_expansion:
+        os.environ["PRIORART_POOL_EXPANSION"] = "false"
 
     runtime = Runtime(repo)
     index_started = time.perf_counter()
@@ -296,6 +304,11 @@ def _run_benchmark(args) -> dict:
                 "rerank_document": RERANK_DOCUMENT_FORMAT,
                 "candidate_limit": CANDIDATE_LIMIT,
                 "rrf_k": RRF_K,
+                "pool_expansion": {
+                    "enabled": runtime.config.pool_expansion,
+                    "file_quota": EXPANSION_FILE_QUOTA,
+                    "limit": EXPANSION_LIMIT,
+                },
             },
             "expansion_prompt_sha256": hashlib.sha256(EXPAND_PROMPT.encode()).hexdigest(),
         },
@@ -570,6 +583,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=BODY_MAX_CHARS,
         help=f"Max body characters per rerank document (default: {BODY_MAX_CHARS})",
+    )
+    parser.add_argument(
+        "--no-pool-expansion",
+        action="store_true",
+        help="Disable file-to-owner pool expansion (control runs)",
     )
     parser.add_argument(
         "--publish",

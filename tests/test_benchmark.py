@@ -55,7 +55,7 @@ def test_benchmark_scores_exact_symbol_identity():
     }
 
 
-def _trace(*, fts=(99,), vec=(99,), fused=(99,)):
+def _trace(*, fts=(99,), vec=(99,), fused=(99,), expansion=()):
     from priorart.search import SearchTrace
 
     return SearchTrace(
@@ -65,6 +65,7 @@ def _trace(*, fts=(99,), vec=(99,), fused=(99,)):
         vec_rankings=[list(vec)],
         fused=[(symbol_id, 0.01) for symbol_id in fused],
         rerank_order=None,
+        expansion=list(expansion),
     )
 
 
@@ -89,6 +90,19 @@ def test_loss_stage_classifies_misses():
 
     not_fetched = _trace(fts=(gold,), vec=(), fused=(gold,))
     assert benchmark.loss_stage(gold, not_fetched, rank=None, k=10) == "not_fetched"
+
+
+def test_loss_stage_counts_pool_expansion_members():
+    benchmark = _benchmark_module()
+    gold = 42
+
+    rescued = _trace(fts=(7,), vec=(7,), fused=(7,), expansion=(gold,))
+    assert benchmark.loss_stage(gold, rescued, rank=None, k=10) == "not_fetched"
+    assert benchmark.loss_stage(gold, rescued, rank=12, k=10) == "ranked_deep"
+    assert benchmark.retrieved_by(gold, rescued) == ["expansion"]
+
+    still_cut = _trace(fts=(gold,), vec=(gold,), fused=(7,), expansion=(5,))
+    assert benchmark.loss_stage(gold, still_cut, rank=None, k=10) == "pool_cutoff"
 
 
 def test_priorart_revision_records_sha_and_dirty_flag():
@@ -751,6 +765,14 @@ def test_obfuscate_replaces_compound_identifiers(tmp_path):
 
     assert obfuscator.text("ACME_BASE_URL is not set") == "ZETA_BASE_URL is not set"
     assert obfuscator.text("robot/acme_config.yaml") == "robot/zeta_config.yaml"
+
+
+def test_obfuscate_replaces_camel_case_compounds(tmp_path):
+    _, obfuscator = _obfuscator(tmp_path)
+
+    assert obfuscator.text("AcmeMemoryAncestryChecker") == "ZetaMemoryAncestryChecker"
+    assert obfuscator.text("OrbisMemoryRouter()") == "NovaMemoryRouter()"
+    assert obfuscator.text("MemoryRouter uses AcmeClient") == "MemoryRouter uses ZetaClient"
 
 
 def test_obfuscate_keeps_similar_words_untouched(tmp_path):

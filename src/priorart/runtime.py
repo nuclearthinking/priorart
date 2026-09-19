@@ -34,6 +34,7 @@ class Runtime:
                 expand_fn=self.expand,
                 embed_fn=self.embed,
                 rerank_fn=self.rerank,
+                pool_expansion=self.config.pool_expansion,
             )
 
     def reindex(self, *, rebuild: bool = False) -> dict:
