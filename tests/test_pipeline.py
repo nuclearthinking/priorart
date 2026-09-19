@@ -60,7 +60,7 @@ def test_full_signature_falls_back_for_bodyless_definitions():
     assert symbol.full_signature == symbol.signature == "Server struct {"
 
 
-def test_full_signature_reaches_rerank_documents(tmp_path):
+def test_full_signature_and_body_reach_rerank_documents(tmp_path):
     (tmp_path / "sample.py").write_text(MULTILINE)
     repo = tmp_path.resolve()
     conn = connect(tmp_path / "test.db", embed_dim=8)
@@ -76,10 +76,16 @@ def test_full_signature_reaches_rerank_documents(tmp_path):
     top = report.candidates[0]
     assert top.qualname == "connect"
     assert top.full_signature == "def connect(\n    host: str,\n    port: int = 5432,\n):"
+    assert top.body == (
+        "def connect(\n    host: str,\n    port: int = 5432,\n):\n"
+        '    """Connect."""\n    return host, port'
+    )
     assert captured["documents"][0] == (
         "sample.py :: connect (function)\n"
         "def connect(\n    host: str,\n    port: int = 5432,\n):\n"
-        "Connect."
+        "Connect.\n"
+        "def connect(\n    host: str,\n    port: int = 5432,\n):\n"
+        '    """Connect."""\n    return host, port'
     )
 
 

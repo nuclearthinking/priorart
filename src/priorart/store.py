@@ -6,7 +6,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 try:
     APP_VERSION = version("priorart")
@@ -51,6 +51,7 @@ SCHEMA_STATEMENTS = (
         signature TEXT NOT NULL,
         full_signature TEXT NOT NULL,
         docstring TEXT NOT NULL,
+        body TEXT NOT NULL,
         search_text TEXT NOT NULL,
         embed_text TEXT NOT NULL
     )""",

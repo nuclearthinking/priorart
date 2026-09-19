@@ -25,23 +25,24 @@ self-contained candidate pool.
 | 2 · correctness hardening — `e32da78` | 2026-09-19 | 0.70 | 0.458 | 9.1 s | 17.3 s | 2 partial-parse surfaced |
 | 3 · observability, traces + pool artifact | 2026-09-19 | 0.70 | 0.458 | 3.7 s | 16.3 s | 0 |
 | 4 · locator rerank documents | 2026-09-19 | 0.80 | 0.593 | 4.0 s | 19.0 s | 0 |
+| 5 · body rerank documents | 2026-09-19 | 0.85 | 0.806 | 6.7 s | 16.8 s | 0 |
 
 ```mermaid
 xychart-beta
     title "Retrieval quality by iteration (upper: Recall@10, lower: MRR@10)"
-    x-axis ["baseline", "hardened", "pool", "locator"]
+    x-axis ["baseline", "hardened", "pool", "locator", "body"]
     y-axis "score" 0 --> 0.9
-    bar [0.70, 0.70, 0.70, 0.80]
-    bar [0.457, 0.458, 0.458, 0.593]
+    bar [0.70, 0.70, 0.70, 0.80, 0.85]
+    bar [0.457, 0.458, 0.458, 0.593, 0.806]
 ```
 
 ```mermaid
 xychart-beta
     title "Query latency by iteration (upper: p95, lower: p50, seconds)"
-    x-axis ["baseline", "hardened", "pool", "locator"]
+    x-axis ["baseline", "hardened", "pool", "locator", "body"]
     y-axis "seconds" 0 --> 22
-    bar [8.9, 9.1, 3.7, 4.0]
-    bar [19.9, 17.3, 16.3, 19.0]
+    bar [8.9, 9.1, 3.7, 4.0, 6.7]
+    bar [19.9, 17.3, 16.3, 19.0, 16.8]
 ```
 
 **Iteration 1 — first full measurement.** The hybrid pipeline with remote
@@ -67,30 +68,41 @@ latency improved with a warm self-hosted stack.
 
 ### Rerank document A/B
 
-Run 3's frozen pool replayed through the rerank stage alone — no re-indexing,
-no re-embedding, one variable changed:
+Frozen pools replayed through the rerank stage alone — no re-indexing,
+no re-embedding, one variable changed. The first A/B used run 3's pool; the
+second used run 4's pool (which carries full signatures):
 
 | Format | Recall@10 | MRR@10 | Rerank p50 |
 |--------|----------:|-------:|-----------:|
 | A · `signature + docstring` (legacy) | 0.70 | 0.458 | 0.30 s |
 | B · `path + qualname + kind + full signature + docstring` | **0.85** | **0.592** | 0.77 s |
+| B on run 4's pool (control) | 0.85 | 0.598 | 0.76 s |
+| C · B + body (≤ 3000 chars) | **0.90** | **0.813** | 2.81 s |
 
 ```mermaid
 xychart-beta
     title "Rerank document format on the frozen pool"
-    x-axis ["A · signature-docstring", "B · locator"]
+    x-axis ["A · signature-docstring", "B · locator", "C · locator + body"]
     y-axis "score" 0 --> 1
-    bar [0.70, 0.85]
-    bar [0.458, 0.592]
+    bar [0.70, 0.85, 0.90]
+    bar [0.458, 0.598, 0.813]
 ```
 
 Control A reproduced all 20 ranks of run 3 — the reranker is deterministic,
-so the delta is attributable to the document format. B won on the three
+so the delta is attributable to the document format. The B control on run
+4's pool reproduced 19 of 20 source ranks with one adjacent-rank boundary
+flip (11→10), which bounds the observed rerank noise. B won on the three
 target cases (49→9, 23→2, 9→2) plus two more, at the cost of one regression
 (9→42, name-attraction: locator headers can promote lexically similar
-symbols over the true owner). B is now the product rerank document; the
-index stores full multi-line signatures (schema v3). Remaining misses: two
-gold symbols absent from the pool, one ranked deep.
+symbols over the true owner).
+
+The body budget curve on the same pool: 0 chars → 0.85/0.598, 400 →
+0.85/0.689, 1200 → 0.85/0.747, 3000 → **0.90/0.813**, 6000 → 0.90/0.831.
+Returns saturate past 3000 chars while p95 latency keeps growing, so 3000 is
+the product budget. Body resolves the name-attraction regression (37→8: the
+reranker can see which symbol actually owns the logic) and lifts every
+improved-or-equal case with zero regressions. C is now the product rerank
+document; the index stores source bodies (schema v4).
 
 **Iteration 4 — locator rerank documents.** The rerank document changed from
 `signature + docstring` to `path + qualname + kind + full signature +
@@ -103,6 +115,19 @@ pool expansion); one miss ran with a disclosed expansion failure (transient
 name-attraction tradeoff of locator headers. The `rerank-b` replay artifact
 links to run 3's pool via `manifest.replay`, so the format comparison stays
 reproducible.
+
+**Iteration 5 — body rerank documents.** The rerank document gained a bounded
+source body (up to 3000 chars, cut at a line boundary with an explicit
+truncation marker), stored in the index as the symbol's full source span
+(schema v4). First full end-to-end run: 17/20 and MRR 0.806, confirming the
+fixed-pool result (18/20, the pool ceiling) within query-expansion
+non-determinism — the last miss sits at rank 12 in the product run vs 8 in
+replay. The two pool-absent misses are unchanged (planned pool expansion).
+Rerank latency roughly triples (p50 0.76 → 2.8 s per query on the replay
+path), which the quality gain pays for. The `rerank-b-control` and
+`rerank-c-body3000` replay artifacts link to run 4's published pool via
+`manifest.replay`, and `body_from` records the snapshot the bodies were
+extracted from.
 
 Full per-case detail (top-50 candidates per query, traces, warnings,
 latency) is in the result files in [`results/`](results/).
@@ -155,13 +180,30 @@ indexing, no embedding, the rerank stage only:
 ```bash
 uv run python benchmarks/run.py \
   --replay .bench/results/<pool-artifact>.json \
-  --rerank-format path-qualname-kind-signature-docstring-v1 \
+  --rerank-format path-qualname-kind-signature-docstring-body-v1 \
   --label my-experiment
 ```
 
-Formats: `path-qualname-kind-signature-docstring-v1` (product) and
+Formats: `path-qualname-kind-signature-docstring-body-v1` (product),
+`path-qualname-kind-signature-docstring-v1` (locator control) and
 `signature-docstring-v1` (legacy control). Replays require an artifact from
 the current runner (the pool must contain saved documents).
+
+The body format needs a `body` field per candidate. Pools saved by the
+current runner carry it; older pools can be enriched from the frozen
+repository snapshot, which also makes the replay output self-contained:
+
+```bash
+uv run python benchmarks/run.py \
+  --replay .bench/results/<pool-artifact>.json \
+  --rerank-format path-qualname-kind-signature-docstring-body-v1 \
+  --body-from /path/to/frozen/repository \
+  --body-chars 3000
+```
+
+`--body-chars` bounds the body per document (default 3000, the product
+budget); the manifest records the budget and the snapshot the bodies came
+from.
 
 ## Tracked obfuscated results
 

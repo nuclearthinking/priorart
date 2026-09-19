@@ -12,18 +12,27 @@ import time
 from collections import Counter
 from dataclasses import asdict
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 from priorart.config import Config
 from priorart.expand import EXPAND_PROMPT
-from priorart.indexer import preflight_parsers, repo_languages
+from priorart.indexer import LANGS, parse_source, preflight_parsers, repo_languages
 from priorart.rerank import make_reranker
 from priorart.runtime import Runtime
-from priorart.search import CANDIDATE_LIMIT, RERANK_DOCUMENT_FORMAT, RRF_K, _valid_rerank
+from priorart.search import (
+    BODY_MAX_CHARS,
+    CANDIDATE_LIMIT,
+    RERANK_DOCUMENT_FORMAT,
+    RRF_K,
+    _valid_rerank,
+    bounded_body,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
 LEGACY_DOCUMENT_FORMAT = "signature-docstring-v1"
+LEGACY_LOCATOR_FORMAT = "path-qualname-kind-signature-docstring-v1"
 
 
 def _document_signature_docstring(candidate: dict) -> str:
@@ -35,10 +44,27 @@ def _document_locator_signature_docstring(candidate: dict) -> str:
     return f"{header}\n{candidate['full_signature']}\n{candidate['docstring']}"
 
 
-RERANK_DOCUMENT_BUILDERS = {
-    RERANK_DOCUMENT_FORMAT: _document_locator_signature_docstring,
-    LEGACY_DOCUMENT_FORMAT: _document_signature_docstring,
-}
+def _document_locator_signature_docstring_body(candidate: dict, max_chars: int) -> str:
+    header = f"{candidate['path']} :: {candidate['qualname']} ({candidate['kind']})"
+    body = bounded_body(candidate["body"], max_chars)
+    return f"{header}\n{candidate['full_signature']}\n{candidate['docstring']}\n{body}"
+
+
+DOCUMENT_FORMAT_IDS = (
+    RERANK_DOCUMENT_FORMAT,
+    LEGACY_LOCATOR_FORMAT,
+    LEGACY_DOCUMENT_FORMAT,
+)
+
+
+def _document_builder(format_id: str, body_max_chars: int):
+    if format_id == RERANK_DOCUMENT_FORMAT:
+        return partial(_document_locator_signature_docstring_body, max_chars=body_max_chars)
+    if format_id == LEGACY_LOCATOR_FORMAT:
+        return _document_locator_signature_docstring
+    if format_id == LEGACY_DOCUMENT_FORMAT:
+        return _document_signature_docstring
+    raise SystemExit(f"unknown rerank format: {format_id}")
 
 
 def _obfuscation():
@@ -174,6 +200,8 @@ def _require_benchmark_args(args) -> None:
         raise SystemExit("--repo is required")
     if args.rerank_format:
         raise SystemExit("--rerank-format requires --replay")
+    if args.body_from is not None:
+        raise SystemExit("--body-from requires --replay")
 
 
 def _run_benchmark(args) -> dict:
@@ -216,6 +244,7 @@ def _run_benchmark(args) -> dict:
                 "signature": candidate.signature,
                 "full_signature": candidate.full_signature,
                 "docstring": candidate.docstring,
+                "body": candidate.body,
             }
             for candidate in report.candidates
         ]
@@ -274,9 +303,13 @@ def _run_benchmark(args) -> dict:
 def _run_replay(source: dict, rerank_fn, rerank_model: str, args) -> dict:
     cases_in = _replay_source_cases(source)
     format_id = args.rerank_format
-    if format_id not in RERANK_DOCUMENT_BUILDERS:
+    if format_id not in DOCUMENT_FORMAT_IDS:
         raise SystemExit(f"unknown rerank format: {format_id}")
-    build_document = RERANK_DOCUMENT_BUILDERS[format_id]
+    if args.body_from is not None:
+        _attach_bodies(source, args.body_from.resolve())
+    if format_id == RERANK_DOCUMENT_FORMAT:
+        _require_bodies(cases_in)
+    build_document = _document_builder(format_id, args.body_chars)
     cases = []
     for case in cases_in:
         replayed = _replay_case(case, rerank_fn, build_document, args.k)
@@ -284,6 +317,20 @@ def _run_replay(source: dict, rerank_fn, rerank_model: str, args) -> dict:
         rank = replayed["rank"]
         outcome = f"HIT {rank}" if rank is not None and rank <= args.k else f"OUT {rank or '-'}"
         print(f"{outcome:>6}  {case['id']}  {replayed['latency_seconds']:.2f}s", flush=True)
+    representation = {"rerank_document": format_id}
+    if format_id == RERANK_DOCUMENT_FORMAT:
+        representation["body_max_chars"] = args.body_chars
+    manifest = {
+        "representation": representation,
+        "replay": {
+            "source": args.replay.name,
+            "source_label": source.get("label"),
+            "source_created_at": source.get("created_at"),
+            "pool_size": source.get("save_depth"),
+        },
+    }
+    if args.body_from is not None:
+        manifest["body_from"] = {"repo": str(args.body_from), "revision": source.get("revision")}
     return {
         "suite": source.get("suite"),
         "revision": source.get("revision"),
@@ -291,15 +338,7 @@ def _run_replay(source: dict, rerank_fn, rerank_model: str, args) -> dict:
         "label": args.label or f"replay-{format_id}",
         "priorart": priorart_revision(),
         "models": {"reranker": rerank_model},
-        "manifest": {
-            "representation": {"rerank_document": format_id},
-            "replay": {
-                "source": args.replay.name,
-                "source_label": source.get("label"),
-                "source_created_at": source.get("created_at"),
-                "pool_size": source.get("save_depth"),
-            },
-        },
+        "manifest": manifest,
         "k": args.k,
         "candidate_depth": source.get("candidate_depth"),
         "save_depth": source.get("save_depth"),
@@ -332,6 +371,56 @@ def _replay_source_cases(source: dict) -> list[dict]:
                     "re-run the benchmark with the current runner first"
                 )
     return cases_in
+
+
+def _attach_bodies(source: dict, repo: Path) -> None:
+    """Attach each pool candidate's source span as `body`, parsed from the snapshot."""
+    _verify_snapshot(repo, source["revision"])
+    parsed: dict[str, tuple[list[str], dict[str, tuple[int, int]]]] = {}
+    for case in source["cases"]:
+        for candidate in case.get("results") or []:
+            if candidate.get("body"):
+                continue
+            entry = parsed.get(candidate["path"])
+            if entry is None:
+                data = (repo / candidate["path"]).read_bytes()
+                lang = LANGS.get(Path(candidate["path"]).suffix)
+                if lang is None:
+                    raise SystemExit(f"cannot extract body: unsupported file {candidate['path']}")
+                result = parse_source(data, lang, candidate["path"])
+                lines = data.decode("utf-8", "replace").splitlines()
+                spans: dict[str, tuple[int, int]] = {}
+                for symbol in result.symbols:
+                    spans.setdefault(symbol.qualname, (symbol.line, symbol.end_line))
+                entry = (lines, spans)
+                parsed[candidate["path"]] = entry
+            lines, spans = entry
+            span = spans.get(candidate["qualname"])
+            if span is None:
+                raise SystemExit(
+                    f"cannot extract body: {candidate['path']} has no symbol "
+                    f"{candidate['qualname']}"
+                )
+            start, end = span
+            if start != candidate["line"]:
+                raise SystemExit(
+                    f"snapshot drift: {candidate['path']}::{candidate['qualname']} moved "
+                    f"from line {candidate['line']} to {start}"
+                )
+            candidate["body"] = "\n".join(lines[start - 1 : end])
+
+
+def _require_bodies(cases_in: list[dict]) -> None:
+    missing = sum(
+        1
+        for case in cases_in
+        for candidate in case.get("results") or []
+        if not candidate.get("body")
+    )
+    if missing:
+        raise SystemExit(
+            f"body format needs --body-from or a pool with bodies ({missing} candidates lack body)"
+        )
 
 
 def _replay_case(case: dict, rerank_fn, build_document, k: int):
@@ -433,8 +522,19 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rerank-format",
-        choices=sorted(RERANK_DOCUMENT_BUILDERS),
+        choices=DOCUMENT_FORMAT_IDS,
         help="Rerank document format for --replay",
+    )
+    parser.add_argument(
+        "--body-from",
+        type=Path,
+        help="Repository snapshot to extract candidate bodies from (replay only)",
+    )
+    parser.add_argument(
+        "--body-chars",
+        type=int,
+        default=BODY_MAX_CHARS,
+        help=f"Max body characters per rerank document (default: {BODY_MAX_CHARS})",
     )
     parser.add_argument(
         "--publish",

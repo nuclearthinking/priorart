@@ -121,6 +121,8 @@ def _replay_args(**overrides):
         "suite": None,
         "rebuild": False,
         "save_depth": None,
+        "body_from": None,
+        "body_chars": 1200,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -221,17 +223,45 @@ def test_replay_documents_match_format_specs():
         "signature": "def run(self):",
         "full_signature": "def run(self, force: bool):",
         "docstring": "Run the example.",
+        "body": "def run(self, force: bool):\n    return force",
     }
-    legacy = benchmark.RERANK_DOCUMENT_BUILDERS["signature-docstring-v1"]
+    legacy = benchmark._document_builder("signature-docstring-v1", 1200)
     assert legacy(candidate) == "def run(self):\nRun the example."
 
-    locator = benchmark.RERANK_DOCUMENT_BUILDERS["path-qualname-kind-signature-docstring-v1"]
+    locator = benchmark._document_builder("path-qualname-kind-signature-docstring-v1", 1200)
     assert locator(candidate) == (
         "src/example.py :: Example.run (method)\ndef run(self, force: bool):\nRun the example."
     )
 
+    body = benchmark._document_builder("path-qualname-kind-signature-docstring-body-v1", 1200)
+    assert body(candidate) == (
+        "src/example.py :: Example.run (method)\n"
+        "def run(self, force: bool):\n"
+        "Run the example.\n"
+        "def run(self, force: bool):\n"
+        "    return force"
+    )
 
-def test_replay_locator_format_matches_search_rerank_document():
+
+def test_bounded_body_truncates_on_line_boundary():
+    benchmark = _benchmark_module()
+    body = "\n".join(f"line {index}" for index in range(100))
+
+    short = benchmark.bounded_body(body, 10_000)
+    assert short == body
+
+    truncated = benchmark.bounded_body(body, 60)
+    kept, marker = truncated.rsplit("\n", 1)
+    assert len(truncated) < 80
+    assert marker.startswith("… (+")
+    assert marker.endswith(" lines)")
+    assert kept.splitlines()[-1] == "line 7"
+
+    single_line = benchmark.bounded_body("x" * 500, 60)
+    assert len(single_line) == 60
+
+
+def test_replay_body_format_matches_search_rerank_document():
     benchmark = _benchmark_module()
     from priorart.search import Candidate, _rerank_document
 
@@ -246,6 +276,7 @@ def test_replay_locator_format_matches_search_rerank_document():
         signature="def run(self):",
         full_signature="def run(self, force: bool):",
         docstring="Run the example.",
+        body="def run(self, force: bool):\n    return force",
         score=0.1,
     )
     saved = {
@@ -254,9 +285,14 @@ def test_replay_locator_format_matches_search_rerank_document():
         "kind": "method",
         "full_signature": "def run(self, force: bool):",
         "docstring": "Run the example.",
+        "body": "def run(self, force: bool):\n    return force",
     }
 
-    builder = benchmark.RERANK_DOCUMENT_BUILDERS["path-qualname-kind-signature-docstring-v1"]
+    from priorart.search import BODY_MAX_CHARS
+
+    builder = benchmark._document_builder(
+        "path-qualname-kind-signature-docstring-body-v1", BODY_MAX_CHARS
+    )
     assert builder(saved) == _rerank_document(candidate)
 
 
@@ -338,6 +374,71 @@ def test_run_replay_rejects_pools_without_saved_documents():
         benchmark._run_replay(source, _reverse_rerank, "reranker-x", _replay_args())
 
 
+def test_run_replay_body_format_requires_bodies():
+    benchmark = _benchmark_module()
+    args = _replay_args(rerank_format="path-qualname-kind-signature-docstring-body-v1")
+
+    with pytest.raises(SystemExit, match="--body-from or a pool with bodies"):
+        benchmark._run_replay(_source_artifact(), _reverse_rerank, "reranker-x", args)
+
+
+def test_run_replay_body_format_ranks_from_pool_bodies():
+    benchmark = _benchmark_module()
+    source = _source_artifact()
+    for case in source["cases"]:
+        for candidate in case.get("results") or []:
+            candidate["line"] = 1
+            candidate["body"] = "def owner():\n    return 1"
+    args = _replay_args(rerank_format="path-qualname-kind-signature-docstring-body-v1")
+
+    result = benchmark._run_replay(source, _reverse_rerank, "reranker-x", args)
+
+    assert result["manifest"]["representation"]["body_max_chars"] == 1200
+    first = result["cases"][0]
+    assert first["rank"] == 1
+    assert first["results"][0]["body"] == "def owner():\n    return 1"
+
+
+def test_attach_bodies_extracts_spans_from_snapshot(tmp_path, monkeypatch):
+    benchmark = _benchmark_module()
+    monkeypatch.setattr(benchmark, "_verify_snapshot", lambda repo, revision: None)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.py").write_text("def run(force):\n    return force\n\n\ndef walk():\n    return 1\n")
+    source = _source_artifact()
+    run_candidate = source["cases"][0]["results"][1]
+    walk_candidate = source["cases"][0]["results"][0]
+    run_candidate["line"] = 1
+    walk_candidate["line"] = 5
+    source["cases"][1]["results"][0]["line"] = 5
+
+    benchmark._attach_bodies(source, repo)
+
+    assert run_candidate["body"] == "def run(force):\n    return force"
+    assert walk_candidate["body"] == "def walk():\n    return 1"
+    assert source["cases"][1]["results"][0]["body"] == "def walk():\n    return 1"
+
+
+def test_attach_bodies_fails_loudly_on_drift_and_missing_symbols(tmp_path, monkeypatch):
+    benchmark = _benchmark_module()
+    monkeypatch.setattr(benchmark, "_verify_snapshot", lambda repo, revision: None)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.py").write_text("def run(force):\n    return force\n\n\ndef walk():\n    return 1\n")
+
+    drifted = _source_artifact()
+    drifted["cases"][0]["results"][0]["line"] = 5
+    drifted["cases"][0]["results"][1]["line"] = 9
+    with pytest.raises(SystemExit, match="snapshot drift"):
+        benchmark._attach_bodies(drifted, repo)
+
+    absent = _source_artifact()
+    absent["cases"][0]["results"][0]["line"] = 1
+    absent["cases"][0]["results"][0]["qualname"] = "gone"
+    with pytest.raises(SystemExit, match="has no symbol"):
+        benchmark._attach_bodies(absent, repo)
+
+
 def test_replay_artifact_wires_configured_reranker(tmp_path, monkeypatch):
     benchmark = _benchmark_module()
     artifact = tmp_path / "artifact.json"
@@ -382,13 +483,15 @@ def test_require_replay_args_rejects_conflicting_flags():
 
 def test_require_benchmark_args_rejects_missing_inputs():
     benchmark = _benchmark_module()
-    base = {"suite": Path("s.json"), "repo": Path("r"), "rerank_format": None}
+    base = {"suite": Path("s.json"), "repo": Path("r"), "rerank_format": None, "body_from": None}
     with pytest.raises(SystemExit, match="--suite is required"):
         benchmark._require_benchmark_args(argparse.Namespace(**{**base, "suite": None}))
     with pytest.raises(SystemExit, match="--repo is required"):
         benchmark._require_benchmark_args(argparse.Namespace(**{**base, "repo": None}))
     with pytest.raises(SystemExit, match="requires --replay"):
         benchmark._require_benchmark_args(argparse.Namespace(**{**base, "rerank_format": "f"}))
+    with pytest.raises(SystemExit, match="--body-from requires --replay"):
+        benchmark._require_benchmark_args(argparse.Namespace(**{**base, "body_from": Path("repo")}))
 
 
 def test_parse_args_accepts_replay_mode(monkeypatch):

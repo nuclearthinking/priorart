@@ -105,6 +105,7 @@ class Symbol:
     signature: str
     full_signature: str
     docstring: str
+    body: str
     search_text: str
     embed_text: str
 
@@ -160,7 +161,8 @@ def parse_source(data: bytes, lang: str, rel_path: str) -> ParseResult:
     except Exception as err:  # noqa: BLE001 - tree-sitter raises varied errors
         return ParseResult([], "error", f"parser raised {type(err).__name__}: {err}")
     out: list[Symbol] = []
-    _walk(tree.root_node, data, [], out, lang, rel_path)
+    lines = data.decode("utf-8", "replace").split("\n")
+    _walk(tree.root_node, data, lines, [], out, lang, rel_path)
     if tree.root_node.has_error:
         if out:
             return ParseResult(out, "partial", "source contains syntax errors")
@@ -197,7 +199,7 @@ def _signature_block(node, data: bytes) -> str:
 
 
 def _walk(  # noqa: PLR0913, PLR0917 - recursive tree walk context
-    node, data: bytes, parents, out: list[Symbol], lang: str, rel_path: str
+    node, data: bytes, lines: list[str], parents, out: list[Symbol], lang: str, rel_path: str
 ) -> None:
     next_parents = parents
     kind = _kind(node)
@@ -209,6 +211,7 @@ def _walk(  # noqa: PLR0913, PLR0917 - recursive tree walk context
             docstring = _docstring(node, data, lang)
             signature = text.split("\n", 1)[0][:200]
             full_signature = _signature_block(node, data) or signature
+            body = "\n".join(lines[node.start_point.row : node.end_point.row + 1])
             search_text = "\n".join(
                 part for part in (qualname, rel_path, signature, docstring) if part
             )
@@ -229,13 +232,14 @@ def _walk(  # noqa: PLR0913, PLR0917 - recursive tree walk context
                     signature=signature,
                     full_signature=full_signature,
                     docstring=docstring,
+                    body=body,
                     search_text=search_text,
                     embed_text=embed_text,
                 )
             )
             next_parents = [*parents, name]
     for child in node.named_children:
-        _walk(child, data, next_parents, out, lang, rel_path)
+        _walk(child, data, lines, next_parents, out, lang, rel_path)
 
 
 def _node_name(node, data: bytes) -> str | None:
@@ -440,8 +444,8 @@ def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int,
     for symbol in symbols:
         cur = conn.execute(
             "INSERT INTO symbols (repo, path, name, qualname, kind, lang, line, end_line, "
-            "signature, full_signature, docstring, search_text, embed_text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "signature, full_signature, docstring, body, search_text, embed_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 repo,
                 symbol.path,
@@ -454,6 +458,7 @@ def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int,
                 symbol.signature,
                 symbol.full_signature,
                 symbol.docstring,
+                symbol.body,
                 symbol.search_text,
                 symbol.embed_text,
             ),

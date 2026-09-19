@@ -10,7 +10,8 @@ from .indexer import _git, _list_files
 
 CANDIDATE_LIMIT = 50
 RRF_K = 60
-RERANK_DOCUMENT_FORMAT = "path-qualname-kind-signature-docstring-v1"
+RERANK_DOCUMENT_FORMAT = "path-qualname-kind-signature-docstring-body-v1"
+BODY_MAX_CHARS = 3000
 
 
 @dataclass
@@ -25,6 +26,7 @@ class Candidate:
     signature: str
     full_signature: str
     docstring: str
+    body: str
     score: float
 
 
@@ -143,6 +145,7 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
                     signature=row[8],
                     full_signature=row[9],
                     docstring=row[10],
+                    body=row[11],
                     score=score,
                 ),
             )
@@ -203,9 +206,23 @@ def _embed_queries(queries: list[str], embed_fn, warnings: list[str]) -> list[by
     return vectors
 
 
+def bounded_body(body: str, max_chars: int = BODY_MAX_CHARS) -> str:
+    if len(body) <= max_chars:
+        return body
+    kept = body[:max_chars]
+    cut = kept.rfind("\n")
+    if cut > 0:
+        kept = kept[:cut]
+    skipped = len(body.splitlines()) - len(kept.splitlines())
+    if skipped <= 0:
+        return kept
+    return f"{kept}\n… (+{skipped} lines)"
+
+
 def _rerank_document(candidate: Candidate) -> str:
     header = f"{candidate.path} :: {candidate.qualname} ({candidate.kind})"
-    return f"{header}\n{candidate.full_signature}\n{candidate.docstring}"
+    body = bounded_body(candidate.body)
+    return f"{header}\n{candidate.full_signature}\n{candidate.docstring}\n{body}"
 
 
 def _apply_rerank(candidates, query, rerank_fn, warnings) -> tuple[list, list[int] | None]:
@@ -400,7 +417,8 @@ def _repo_meta(conn, repo: str) -> tuple[str | None, float | None]:
 
 
 _COLUMNS = (
-    "id, path, name, qualname, kind, lang, line, end_line, signature, full_signature, docstring"
+    "id, path, name, qualname, kind, lang, line, end_line, signature, full_signature, "
+    "docstring, body"
 )
 
 
