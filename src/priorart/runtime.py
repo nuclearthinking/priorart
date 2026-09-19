@@ -16,7 +16,7 @@ class Runtime:
     """Single owner of the database connection; serializes search and refresh."""
 
     def __init__(self, repo: Path, config: Config | None = None):
-        self.config = config or Config.from_env()
+        self.config = config or Config()
         self.repo = Path(repo).resolve()
         self.conn = connect(self.config.db_path, self.config.embed_dim)
         self.embed = embed_mod.make_embedder(self.config)

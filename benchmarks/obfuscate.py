@@ -25,6 +25,29 @@ DEFAULT_REPLACEMENTS_PATH = ROOT / ".bench" / "obfuscation.json"
 REDACTED_KEYS = {"issue_url"}
 
 
+def assert_locator_uniqueness(original: dict, published: dict) -> None:
+    """Verify obfuscation did not collide distinct (path, qualname) locators.
+
+    Ranks are derived from result order, so order is preserved by construction;
+    a collision (two distinct locators mapping to one) is the corruption that
+    would silently change what a published rank points at.
+    """
+    cases_before = original.get("cases", [])
+    cases_after = published.get("cases", [])
+    if len(cases_before) != len(cases_after):
+        raise ValueError(
+            f"obfuscation changed case count: {len(cases_before)} -> {len(cases_after)}"
+        )
+    for case_before, case_after in zip(cases_before, cases_after, strict=True):
+        before = {(result["path"], result["qualname"]) for result in case_before.get("results", [])}
+        after = {(result["path"], result["qualname"]) for result in case_after.get("results", [])}
+        if len(before) != len(after):
+            raise ValueError(
+                f"obfuscation collided locators in case {case_before.get('id')}: "
+                f"{len(before)} distinct before, {len(after)} after"
+            )
+
+
 def load_replacements(path: Path) -> dict[str, str]:
     replacements = json.loads(path.read_text())
     if not isinstance(replacements, dict) or not replacements:

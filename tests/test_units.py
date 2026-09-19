@@ -7,11 +7,12 @@ from pathlib import Path
 
 import httpx
 import pytest
+import sqlite_vec
 from typer.testing import CliRunner
 
 from priorart import embed as embed_mod
 from priorart import expand as expand_mod
-from priorart import httputil
+from priorart import httputil, store
 from priorart.cli import app
 from priorart.config import Config
 from priorart.runtime import Runtime
@@ -333,7 +334,7 @@ def test_git_root_detects_repo_and_rejects_plain_dir(tmp_path):
     assert _git_root(plain) is None
 
 
-def test_legacy_files_table_is_dropped_on_connect(tmp_path):
+def test_legacy_database_is_reset_from_scratch(tmp_path):
     db = tmp_path / "legacy.db"
     legacy = sqlite3.connect(db)
     legacy.execute(
@@ -341,10 +342,165 @@ def test_legacy_files_table_is_dropped_on_connect(tmp_path):
         "size INTEGER NOT NULL, PRIMARY KEY (repo, path))"
     )
     legacy.execute("INSERT INTO files VALUES ('r', 'p', 1.0, 1)")
+    legacy.enable_load_extension(True)  # noqa: FBT003 - sqlite3 positional-only API
+    sqlite_vec.load(legacy)
+    legacy.enable_load_extension(False)  # noqa: FBT003 - sqlite3 positional-only API
+    legacy.execute(
+        "CREATE VIRTUAL TABLE symbols_vec USING vec0("
+        "symbol_id INTEGER PRIMARY KEY, embedding float[4])"
+    )
     legacy.commit()
     legacy.close()
 
     conn = connect(db, embed_dim=4)
+
+    assert not conn.in_transaction
     columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
     assert "mtime_ns" in columns
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+    assert (
+        conn.execute("SELECT value FROM meta WHERE key = 'app_version'").fetchone()[0]
+        == store.APP_VERSION
+    )
+    assert (
+        conn.execute("SELECT sql FROM sqlite_master WHERE name = 'symbols_vec'")
+        .fetchone()[0]
+        .find("partition key")
+        != -1
+    )
+
+
+def test_foreign_database_user_version_is_not_overwritten(tmp_path):
+    db = tmp_path / "foreign.db"
+    foreign = sqlite3.connect(db)
+    foreign.execute("CREATE TABLE app_data (payload TEXT)")
+    foreign.execute("INSERT INTO app_data VALUES ('owned by another application')")
+    foreign.execute("PRAGMA user_version = 42")
+    foreign.commit()
+    foreign.close()
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        connect(db, embed_dim=4)
+
+    raw = sqlite3.connect(db)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 42
+    assert raw.execute("SELECT COUNT(*) FROM app_data").fetchone()[0] == 1
+    raw.close()
+
+
+def test_non_database_file_is_a_loud_runtime_error(tmp_path):
+    db = tmp_path / "garbage.db"
+    db.write_bytes(b"this is not a sqlite database at all")
+
+    with pytest.raises(RuntimeError, match="failed to initialize"):
+        connect(db, embed_dim=4)
+
+
+def test_newer_schema_version_is_reset(tmp_path):
+    db = tmp_path / "future.db"
+    conn = connect(db, embed_dim=4)
+    conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'p', 1, 2)")
+    conn.commit()
+    conn.close()
+
+    raw = sqlite3.connect(db)
+    raw.execute("PRAGMA user_version = 99")
+    raw.commit()
+    raw.close()
+
+    conn = connect(db, embed_dim=4)
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+
+
+def test_app_version_change_resets_index(tmp_path, monkeypatch):
+    db = tmp_path / "reindex.db"
+    conn = connect(db, embed_dim=4)
+    conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'p', 1, 2)")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(store, "APP_VERSION", "9.9.9-test")
+    conn = connect(db, embed_dim=4)
+
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT value FROM meta WHERE key = 'app_version'").fetchone()[0]
+        == "9.9.9-test"
+    )
+
+
+def test_embed_dim_change_resets_index(tmp_path):
+    db = tmp_path / "dim.db"
+    conn = connect(db, embed_dim=4)
+    conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'p', 1, 2)")
+    conn.commit()
+    conn.close()
+
+    conn = connect(db, embed_dim=8)
+
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    assert conn.execute("SELECT value FROM meta WHERE key = 'embed_dim'").fetchone()[0] == "8"
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+
+
+def test_connect_reopen_preserves_index_and_is_noop(tmp_path):
+    db = tmp_path / "reopen.db"
+    conn = connect(db, embed_dim=4)
+    conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'p', 1, 2)")
+    conn.commit()
+    conn.close()
+
+    conn = connect(db, embed_dim=4)
+    assert not conn.in_transaction
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+
+
+def test_failed_schema_creation_is_atomic(tmp_path, monkeypatch):
+    from priorart import store as store_mod
+
+    db = tmp_path / "partial.db"
+    monkeypatch.setattr(
+        store_mod,
+        "SCHEMA_STATEMENTS",
+        ("CREATE TABLE repos (repo TEXT PRIMARY KEY)", "CREATE TABLE bad ("),
+    )
+    with pytest.raises(RuntimeError, match="failed to initialize"):
+        connect(db, embed_dim=4)
+
+    raw = sqlite3.connect(db)
+    assert raw.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall() == []
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 0
+    raw.close()
+
+    monkeypatch.undo()
+    conn = connect(db, embed_dim=4)
+    assert not conn.in_transaction
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+
+
+def test_rollback_without_transaction_is_noop(tmp_path):
+    from priorart import store as store_mod
+
+    conn = connect(tmp_path / "noop.db", embed_dim=4)
+    assert not conn.in_transaction
+    store_mod._rollback(conn)
+
+
+def test_rollback_discards_open_transaction(tmp_path):
+    from priorart import store as store_mod
+
+    db = tmp_path / "rollback.db"
+    conn = connect(db, embed_dim=4)
+    conn.execute("BEGIN")
+    conn.execute("CREATE TABLE stray (x INTEGER)")
+    store_mod._rollback(conn)
+    assert not conn.in_transaction
+    assert (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stray'"
+        ).fetchall()
+        == []
+    )

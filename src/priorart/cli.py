@@ -14,7 +14,8 @@ app = typer.Typer(help="Local agentic code search: find existing symbols before 
 @app.command()
 def index(
     path: Annotated[Path | None, typer.Argument(help="Repository to index.")] = None,
-    rebuild: Annotated[  # noqa: FBT002
+    *,
+    rebuild: Annotated[
         bool, typer.Option("--rebuild", help="Reindex and re-embed everything.")
     ] = False,
 ) -> None:

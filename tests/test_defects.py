@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from priorart.indexer import ParseResult, index_repo, parse_source
-from priorart.search import _fetch, _valid_rerank, fts_search, search, status_text
+from priorart.search import (
+    _fetch,
+    _valid_rerank,
+    format_report,
+    fts_search,
+    search,
+    status_text,
+)
 from priorart.store import connect
 
 SAMPLE = '''\
@@ -580,3 +587,226 @@ def test_search_dense_path_inside_read_transaction(tmp_path):
     assert report.candidates
     assert report.warnings == []
     assert not conn.in_transaction
+
+
+def test_partial_parse_state_persists_across_refreshes(tmp_path, monkeypatch):
+    from priorart import indexer
+
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def good(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    symbol = parse_source(b"def partial(): pass\n", "python", "sample.py").symbols[0]
+    monkeypatch.setattr(
+        indexer, "parse_source", lambda data, lang, rel: ParseResult([symbol], "partial", "syntax")
+    )
+    (repo / "sample.py").write_text("def changed(): pass\n")
+
+    stats = index_repo(conn, repo)
+    assert any("partial parse" in warning for warning in stats["warnings"])
+
+    # the warning disappears on the next unchanged refresh, but the state persists
+    stats = index_repo(conn, repo)
+    assert stats["warnings"] == []
+
+    status, attempted_at = conn.execute(
+        "SELECT status, attempted_at FROM parse_state WHERE repo = ? AND path = 'sample.py'",
+        (str(repo),),
+    ).fetchone()
+    assert status == "partial"
+    assert attempted_at > 0
+    assert "1 partial" in status_text(conn, str(repo), dense=False)
+
+    report = search(conn, str(repo), "partial", k=3)
+    assert report.parse_coverage == {"partial": 1}
+    assert "parse issues: 1 partial" in format_report(report)
+
+
+def test_parse_error_state_persists_and_retries(tmp_path, monkeypatch):
+    from priorart import indexer
+
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def good(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    monkeypatch.setattr(
+        indexer, "parse_source", lambda data, lang, rel: ParseResult([], "error", "boom")
+    )
+    (repo / "sample.py").write_text("def changed(): pass\n")
+
+    for _ in range(2):
+        stats = index_repo(conn, repo)
+        assert stats["warnings"] == ["sample.py: parse error (boom); kept previous symbols"]
+
+    status = conn.execute(
+        "SELECT status FROM parse_state WHERE repo = ? AND path = 'sample.py'", (str(repo),)
+    ).fetchone()[0]
+    assert status == "error"
+    assert "1 error" in status_text(conn, str(repo), dense=False)
+
+
+def test_unreadable_file_state_is_persisted(tmp_path, monkeypatch):
+    from priorart import indexer
+
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def good(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    monkeypatch.setattr(indexer, "_capture_file", lambda root, rel: None)
+    (repo / "sample.py").write_text("def changed(): pass\n")
+
+    stats = index_repo(conn, repo)
+    assert any("unreadable" in warning for warning in stats["warnings"])
+    status = conn.execute(
+        "SELECT status FROM parse_state WHERE repo = ? AND path = 'sample.py'", (str(repo),)
+    ).fetchone()[0]
+    assert status == "unreadable"
+
+
+def test_removed_file_cleans_parse_state(tmp_path, monkeypatch):
+    from priorart import indexer
+
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text("def good(): pass\n")
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    symbol = parse_source(b"def partial(): pass\n", "python", "sample.py").symbols[0]
+    monkeypatch.setattr(
+        indexer, "parse_source", lambda data, lang, rel: ParseResult([symbol], "partial", "syntax")
+    )
+    (repo / "sample.py").write_text("def changed(): pass\n")
+    index_repo(conn, repo)
+    assert (
+        conn.execute("SELECT COUNT(*) FROM parse_state WHERE repo = ?", (str(repo),)).fetchone()[0]
+        == 1
+    )
+
+    (repo / "sample.py").unlink()
+    _git(repo, "rm", "-q", "sample.py")
+    _git(repo, "commit", "-q", "-m", "remove")
+    index_repo(conn, repo)
+
+    assert (
+        conn.execute("SELECT COUNT(*) FROM parse_state WHERE repo = ?", (str(repo),)).fetchone()[0]
+        == 0
+    )
+    assert "parse:" not in status_text(conn, str(repo), dense=False)
+
+
+def test_preflight_parsers_reports_original_error(monkeypatch):
+    from priorart import indexer
+
+    monkeypatch.setattr(indexer, "_parsers", {})
+    monkeypatch.setattr(indexer, "_parser_errors", {})
+
+    def refusing(lang):
+        raise ConnectionError("connection refused while downloading grammar")
+
+    monkeypatch.setattr(indexer, "get_parser", refusing)
+    failures = indexer.preflight_parsers(["go", "python"])
+    assert set(failures) == {"go", "python"}
+    assert all(reason.startswith("ConnectionError:") for reason in failures.values())
+
+    result = indexer.parse_source(b"x = 1", "python", "x.py")
+    assert result.status == "unsupported"
+    assert "ConnectionError: connection refused while downloading grammar" in result.detail
+
+
+def test_preflight_parsers_passes_when_parsers_load(monkeypatch):
+    from priorart import indexer
+
+    monkeypatch.setattr(indexer, "_parsers", {})
+    monkeypatch.setattr(indexer, "_parser_errors", {})
+
+    assert indexer.preflight_parsers(["python"]) == {}
+
+
+def test_repo_languages_lists_languages_of_tracked_files(tmp_path):
+    from priorart import indexer
+
+    repo = _init_repo(tmp_path)
+    (repo / "code.py").write_text("def f(): pass\n")
+    (repo / "tool.go").write_text("package main\n")
+    _git(repo, "add", "code.py", "tool.go")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    assert indexer.repo_languages(repo) == ["go", "python"]
+
+
+def _qualname_to_id(conn, repo: Path) -> dict[str, int]:
+    return {
+        row[1]: row[0]
+        for row in conn.execute("SELECT id, qualname FROM symbols WHERE repo = ?", (str(repo),))
+    }
+
+
+def test_search_records_stage_trace(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text(SAMPLE)
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path, embed_fn=_vector)
+
+    report = search(
+        conn,
+        str(repo),
+        "split unified diff",
+        k=3,
+        expand_fn=lambda q: (["diff viewer"], None),
+        embed_fn=_vector,
+        rerank_fn=lambda query, documents: (
+            [(index, float(len(documents) - index)) for index in range(len(documents))],
+            None,
+        ),
+    )
+    trace = report.trace
+    assert trace is not None
+    assert trace.queries == ["split unified diff", "diff viewer"]
+    assert set(trace.stage_seconds) == {"expand", "embed", "retrieve", "rerank"}
+    assert all(0 <= seconds < 60 for seconds in trace.stage_seconds.values())
+    assert trace.fts_rankings
+    assert all(trace.fts_rankings)
+    assert trace.vec_rankings
+    assert all(trace.vec_rankings)
+    assert len(trace.fused) >= len(report.candidates)
+    fused_scores = [score for _symbol_id, score in trace.fused]
+    assert fused_scores == sorted(fused_scores, reverse=True)
+    qualname_to_id = _qualname_to_id(conn, repo)
+    assert trace.rerank_order == [qualname_to_id[c.qualname] for c in report.candidates]
+    assert {symbol_id for symbol_id, _score in trace.fused} == {
+        qualname_to_id[c.qualname] for c in report.candidates
+    }
+
+
+def test_search_trace_records_rerank_fallback(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text(SAMPLE)
+    _git(repo, "add", "sample.py")
+    _git(repo, "commit", "-q", "-m", "init")
+    conn, _ = _index(repo, tmp_path)
+
+    report = search(
+        conn,
+        str(repo),
+        "sample.py",
+        k=3,
+        rerank_fn=lambda query, documents: ([(0, 9.0)], None),
+    )
+    trace = report.trace
+    assert trace is not None
+    assert trace.queries == ["sample.py"]
+    assert trace.vec_rankings == []
+    assert trace.rerank_order is None
+    assert any("invalid or incomplete" in warning for warning in report.warnings)
+    qualname_to_id = _qualname_to_id(conn, repo)
+    assert [symbol_id for symbol_id, _score in trace.fused] == [
+        qualname_to_id[c.qualname] for c in report.candidates
+    ]

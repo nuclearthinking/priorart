@@ -103,6 +103,7 @@ class Symbol:
     line: int
     end_line: int
     signature: str
+    full_signature: str
     docstring: str
     search_text: str
     embed_text: str
@@ -119,21 +120,41 @@ class ParseResult:
 
 
 _parsers: dict[str, object] = {}
+_parser_errors: dict[str, str] = {}
 
 
 def _parser(lang: str):
     if lang not in _parsers:
         try:
             _parsers[lang] = get_parser(lang)
-        except Exception:  # noqa: BLE001 - language packs raise varied errors
+        except Exception as err:  # noqa: BLE001 - language packs raise varied errors
             _parsers[lang] = None
+            _parser_errors[lang] = f"{type(err).__name__}: {err}"
     return _parsers[lang]
+
+
+def preflight_parsers(langs) -> dict[str, str]:
+    """Load parsers up front; return per-language failure reasons."""
+    failures: dict[str, str] = {}
+    for lang in sorted(set(langs)):
+        if _parser(lang) is None:
+            failures[lang] = _parser_errors.get(lang, "unknown error")
+    return failures
+
+
+def repo_languages(root: Path) -> list[str]:
+    root = Path(root)
+    return sorted({LANGS[Path(rel).suffix] for rel in _list_files(root)})
 
 
 def parse_source(data: bytes, lang: str, rel_path: str) -> ParseResult:
     parser = _parser(lang)
     if parser is None:
-        return ParseResult([], "unsupported", f"no parser available for language {lang!r}")
+        detail = f"no parser available for language {lang!r}"
+        reason = _parser_errors.get(lang)
+        if reason:
+            detail = f"{detail} ({reason})"
+        return ParseResult([], "unsupported", detail)
     try:
         tree = parser.parse(data)
     except Exception as err:  # noqa: BLE001 - tree-sitter raises varied errors
@@ -167,6 +188,14 @@ def _kind(node) -> str | None:
     return None
 
 
+def _signature_block(node, data: bytes) -> str:
+    """Full definition header up to (excluding) the body; empty for bodyless nodes."""
+    body = node.child_by_field_name("body")
+    if body is None:
+        return ""
+    return data[node.start_byte : body.start_byte].decode("utf-8", "replace").strip()
+
+
 def _walk(  # noqa: PLR0913, PLR0917 - recursive tree walk context
     node, data: bytes, parents, out: list[Symbol], lang: str, rel_path: str
 ) -> None:
@@ -179,6 +208,7 @@ def _walk(  # noqa: PLR0913, PLR0917 - recursive tree walk context
             qualname = ".".join([*parents, name])
             docstring = _docstring(node, data, lang)
             signature = text.split("\n", 1)[0][:200]
+            full_signature = _signature_block(node, data) or signature
             search_text = "\n".join(
                 part for part in (qualname, rel_path, signature, docstring) if part
             )
@@ -197,6 +227,7 @@ def _walk(  # noqa: PLR0913, PLR0917 - recursive tree walk context
                     line=node.start_point.row + 1,
                     end_line=node.end_point.row + 1,
                     signature=signature,
+                    full_signature=full_signature,
                     docstring=docstring,
                     search_text=search_text,
                     embed_text=embed_text,
@@ -386,10 +417,12 @@ def index_repo(conn, root: Path, embed_fn=None, *, rebuild: bool = False) -> dic
 def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int, str | None]:
     captured = _capture_file(root, rel)
     if captured is None:
+        _record_parse_state(conn, repo, rel, "unreadable", None)
         return 0, f"{rel}: unreadable or changed while reading; not indexed, will retry"
     data, st = captured
     lang = LANGS[Path(rel).suffix]
     result = parse_source(data, lang, rel)
+    _record_parse_state(conn, repo, rel, result.status, result.detail)
     if result.status in ("unsupported", "error"):
         return 0, f"{rel}: parse {result.status} ({result.detail}); kept previous symbols"
     symbols = result.symbols
@@ -407,8 +440,8 @@ def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int,
     for symbol in symbols:
         cur = conn.execute(
             "INSERT INTO symbols (repo, path, name, qualname, kind, lang, line, end_line, "
-            "signature, docstring, search_text, embed_text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "signature, full_signature, docstring, search_text, embed_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 repo,
                 symbol.path,
@@ -419,6 +452,7 @@ def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int,
                 symbol.line,
                 symbol.end_line,
                 symbol.signature,
+                symbol.full_signature,
                 symbol.docstring,
                 symbol.search_text,
                 symbol.embed_text,
@@ -450,6 +484,14 @@ def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int,
     return count, warning
 
 
+def _record_parse_state(conn, repo: str, rel: str, status: str, detail: str | None) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO parse_state (repo, path, status, detail, attempted_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (repo, rel, status, detail, time.time()),
+    )
+
+
 def _drop_file(conn, repo: str, rel: str) -> None:
     ids = [
         row[0]
@@ -457,6 +499,7 @@ def _drop_file(conn, repo: str, rel: str) -> None:
     ]
     _drop_symbols(conn, ids)
     conn.execute("DELETE FROM files WHERE repo = ? AND path = ?", (repo, rel))
+    conn.execute("DELETE FROM parse_state WHERE repo = ? AND path = ?", (repo, rel))
     conn.commit()
 
 
