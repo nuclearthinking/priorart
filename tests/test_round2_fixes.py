@@ -115,31 +115,43 @@ def test_watcher_backs_off_after_failed_job(tmp_path):
 # --- a restarted daemon does not brick the remote registry --------------------
 
 
-def test_remote_registry_reconnects_after_daemon_restart(tmp_path):
+def test_remote_registry_survives_daemon_restart(tmp_path):
+    import shutil
     import tempfile
+
+    from priorart.coordinator import DaemonClient, RemoteRegistry, profile_fingerprint
 
     socket_dir = Path(tempfile.mkdtemp(prefix="pa-daemon2-", dir="/tmp"))
     socket_path = socket_dir / "d.sock"
     try:
-        with DaemonFixture(tmp_path, socket=socket_path) as registry:
+        daemon = DaemonFixture(tmp_path, socket=socket_path)
+        daemon.thread.start()
+        assert daemon.ready.wait(timeout=10)
+        registry = RemoteRegistry(
+            lambda: DaemonClient(daemon.socket, profile_fingerprint(daemon.config))
+        )
+        try:
             repo = repo_with_files(tmp_path / "repo", {"src/app.py": "def owner():\n    pass\n"})
             handle = registry.resolve(repo)
             wait_job(registry, registry.submit_refresh(handle).job_id)
             assert handle.search("owner", k=3).candidates
 
-            # daemon dies and comes back: the same registry and handle
-            # must transparently reconnect instead of failing forever.
-            # The client's connection is closed first so the in-process
-            # serve thread can drain and release the singleton lock (a
-            # real daemon death frees the flock via the OS immediately).
-            registry._client.close()
-        with DaemonFixture(tmp_path, socket=socket_path):
-            # reconnect through the ORIGINAL registry: its client is dead,
-            # the daemon is new; the factory must rebuild the connection
-            assert handle.search("owner", k=3).candidates
-    finally:
-        import shutil
+            # daemon dies and comes back: every operation owns its
+            # connection, so the same registry and handle keep working
+            daemon.stop.set()
+            daemon.thread.join(timeout=10)
 
+            replacement = DaemonFixture(tmp_path, socket=socket_path)
+            replacement.thread.start()
+            try:
+                assert replacement.ready.wait(timeout=10)
+                assert handle.search("owner", k=3).candidates
+            finally:
+                replacement.stop.set()
+                replacement.thread.join(timeout=10)
+        finally:
+            registry.close()
+    finally:
         shutil.rmtree(socket_dir, ignore_errors=True)
 
 

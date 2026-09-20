@@ -19,6 +19,10 @@ JOB_FAILED = "failed"
 JOB_CANCELLED = "cancelled"
 JOB_INTERRUPTED = "interrupted"
 
+FAILURE_WRITER_BUSY = "WRITER_BUSY"
+FAILURE_REFRESH_FAILED = "REFRESH_FAILED"
+FAILURE_JOB_INTERRUPTED = "JOB_INTERRUPTED"
+
 ACTIVE_STATES = frozenset({JOB_QUEUED, JOB_RUNNING})
 FINAL_STATES = frozenset({JOB_COMPLETED, JOB_DEGRADED, JOB_FAILED, JOB_CANCELLED, JOB_INTERRUPTED})
 
@@ -50,7 +54,7 @@ class Job:
     heartbeat_at: float = 0.0
     counters: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
-    error: str | None = None
+    failure: dict[str, object] | None = None
     lexical_ready: bool = False
     dense_ready: bool = False
     epoch: int = 0
@@ -69,7 +73,7 @@ class Job:
             "heartbeat_at": self.heartbeat_at,
             "counters": dict(self.counters),
             "warnings": list(self.warnings),
-            "error": self.error,
+            "failure": dict(self.failure) if self.failure is not None else None,
             "lexical_ready": self.lexical_ready,
             "dense_ready": self.dense_ready,
             "index_epoch": self.epoch,
@@ -90,7 +94,7 @@ class Job:
             heartbeat_at=payload.get("heartbeat_at", 0.0),
             counters=dict(payload.get("counters", {})),
             warnings=list(payload.get("warnings", [])),
-            error=payload.get("error"),
+            failure=dict(payload["failure"]) if payload.get("failure") is not None else None,
             lexical_ready=payload.get("lexical_ready", False),
             dense_ready=payload.get("dense_ready", False),
             epoch=payload.get("index_epoch", 0),

@@ -177,6 +177,28 @@ def test_multiple_definitions_return_bounded_variants(tmp_path):
         registry.close()
 
 
+def test_exact_duplicate_prefers_production_for_implementation(tmp_path):
+    repo = _repo_with_files(
+        tmp_path / "repo",
+        {
+            "zsrc/app.py": "def duplicate():\n    return 'production'\n",
+            "a/tests/test_app.py": "def duplicate():\n    return 'test'\n",
+        },
+    )
+    registry = _make_registry(tmp_path)
+    try:
+        handle, _job = _refresh(registry, repo)
+        report = handle.search("duplicate", intent="implementation")
+        assert [candidate.source_role for candidate in report.candidates] == [
+            "production",
+            "test",
+        ]
+        tests = handle.search("duplicate", intent="tests")
+        assert [candidate.source_role for candidate in tests.candidates] == ["test"]
+    finally:
+        registry.close()
+
+
 def test_natural_language_query_skips_exact_dispatch(tmp_path):
     repo = _repo_with_files(
         tmp_path / "repo",

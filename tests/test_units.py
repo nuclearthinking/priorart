@@ -381,7 +381,7 @@ def test_server_tools_outside_git_repo(tmp_path, monkeypatch):
     from priorart import server as server_mod
 
     monkeypatch.chdir(tmp_path)
-    mcp = server_mod.build_server(None)
+    mcp = server_mod.build_server(None, embedded=True)
     result = asyncio.run(mcp.call_tool("search_codebase", {"query": "anything"}))
     assert result.is_error is True
     assert result.structured_content["error"]["code"] == "REPOSITORY_NOT_SELECTED"
@@ -393,9 +393,9 @@ def test_server_tools_serve_indexed_repo(tmp_path, monkeypatch):
 
     repo = _init_repo(tmp_path / "srv")
     monkeypatch.setenv("PRIORART_INDEX_DIR", str(tmp_path / "srv-indexes"))
-    mcp = server_mod.build_server(repo, config=make_config(tmp_path))
+    mcp = server_mod.build_server(repo, config=make_config(tmp_path), embedded=True)
 
-    result = asyncio.run(mcp.call_tool("status", {}))
+    result = asyncio.run(mcp.call_tool("get_index_status", {}))
     assert result.is_error is False
     assert result.structured_content["index"]["state"] == "absent"
 
@@ -431,11 +431,11 @@ def test_server_tools_serve_indexed_repo(tmp_path, monkeypatch):
     assert sorted(tool.name for tool in tools) == [
         "cancel_index_job",
         "get_index_job",
+        "get_index_status",
         "list_workspaces",
         "map_symbols",
         "refresh_index",
         "search_codebase",
-        "status",
     ]
 
 
@@ -443,7 +443,7 @@ def test_server_rejects_relative_and_wrong_repo(tmp_path):
     from priorart import server as server_mod
 
     repo = _init_repo(tmp_path / "srv")
-    mcp = server_mod.build_server(repo, config=make_config(tmp_path))
+    mcp = server_mod.build_server(repo, config=make_config(tmp_path), embedded=True)
 
     result = asyncio.run(mcp.call_tool("search_codebase", {"query": "x", "repo": "relative/path"}))
     assert result.is_error is True

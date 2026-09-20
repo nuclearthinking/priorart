@@ -2,9 +2,9 @@
 
 Every repository-scoped response carries ``ok``, ``repo``, ``index``,
 ``data``, ``warnings`` and ``timings``. Error responses replace ``data``
-with an ``error`` body and set ``ok=false``. Adapters render the same
-envelope as text (MCP ``content``) and as a machine contract (MCP
-``structuredContent``).
+with an ``error`` body and set ``ok=false``. The envelope is a pure machine
+contract: adapters render their own human text from the typed results and
+never store presentation in ``data``.
 """
 
 from __future__ import annotations
@@ -58,19 +58,3 @@ class Envelope:
         body["warnings"] = self.warnings
         body["timings"] = {key: round(value, 6) for key, value in self.timings.items()}
         return body
-
-    def text(self) -> str:
-        lines: list[str] = []
-        if self.error is not None:
-            lines.append(self.error["message"])
-            lines.extend(
-                f"{key}: {self.error[key]}"
-                for key in ("candidates", "input", "job_id")
-                if key in self.error
-            )
-            lines.append(self.error["next_action"])
-            return "\n".join(lines)
-        lines.extend(f"warning: {warning}" for warning in self.warnings)
-        if self.data.get("text") is not None:
-            lines.append(self.data["text"].rstrip())
-        return "\n".join(lines)

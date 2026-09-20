@@ -1,137 +1,238 @@
-# priorart
+# Priorart
 
-Priorart is a local code-reuse search service for coding agents. Before an
-agent creates a function, class, or module, it can ask whether the repository
-already contains code that should be imported, extended, or refactored.
+Priorart is a local code-reuse search MCP for coding agents. It indexes symbols
+from Git working trees and helps an agent find code to import, extend, or
+refactor before creating a duplicate. Search results are advisory: always read
+the referenced source before reuse.
 
-- tree-sitter symbol extraction for Python, TypeScript/JavaScript, Go, Rust,
-  Java, Ruby, PHP, C, C++, and C#;
-- hybrid SQLite FTS5 and sqlite-vec retrieval with reciprocal-rank fusion;
-- optional LLM query expansion, embeddings, and reranking through configurable
-  HTTP endpoints;
-- MCP tools and a command-line interface;
-- incremental indexing of Git-tracked working-tree files.
+## Use Priorart from Codex
 
-Search results are advisory. Read the referenced source before reusing it.
-
-## Install
+### 1. Install and configure Priorart
 
 ```bash
+git clone https://github.com/nuclearthinking/priorart.git
+cd priorart
 uv sync
-cp .env.example .env
+mkdir -p ~/.priorart
+cp .env.example ~/.priorart/priorart.env
 ```
 
-All remote model stages are optional. With no endpoints configured, Priorart
-uses lexical FTS search and reports which stages were skipped.
+Remote expansion, embedding, and reranking are optional. The default empty
+model settings provide lexical FTS search without network calls.
 
-## Configuration
+### 2. Add the MCP server to Codex
 
-Priorart is provider agnostic. It expects OpenAI-compatible chat and embedding
-endpoints plus a rerank endpoint accepting `query`, `documents`, and `top_n`.
-Base URLs should include the provider API prefix, commonly `/v1`.
+Add this entry to `~/.codex/config.toml`, replacing both absolute paths:
 
-One provider can serve every stage:
-
-| Variable | Purpose |
-|---|---|
-| `PRIORART_BASE_URL` | Shared base URL for expansion, embeddings, and reranking |
-| `PRIORART_API_KEY` | Optional shared bearer token |
-
-Each stage can instead use a separate provider:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `PRIORART_LLM_BASE_URL` | shared base URL | Query-expansion endpoint |
-| `PRIORART_LLM_API_KEY` | shared API key | Query-expansion bearer token |
-| `PRIORART_LLM_MODEL` | disabled | Query-expansion model |
-| `PRIORART_EMBED_BASE_URL` | shared base URL | Embedding endpoint |
-| `PRIORART_EMBED_API_KEY` | shared API key | Embedding bearer token |
-| `PRIORART_EMBED_MODEL` | disabled | Embedding model |
-| `PRIORART_EMBED_DIM` | `1024` | Stored vector dimension |
-| `PRIORART_EMBED_INPUT_FORMAT` | `instruct-text` | Embedding input contract: `instruct-text` wraps queries and documents in `Instruct:`/`Text:` tags; `qwen3` follows the official Qwen3-Embedding usage (instruction prefix on queries only, raw documents, L2-normalized vectors) |
-| `PRIORART_RERANK_BASE_URL` | shared base URL | Rerank endpoint |
-| `PRIORART_RERANK_API_KEY` | shared API key | Reranking bearer token |
-| `PRIORART_RERANK_MODEL` | disabled | Reranking model |
-| `PRIORART_RERANK_PROTOCOL` | `openai` | Rerank client protocol: `openai` posts to the `/v1/rerank` endpoint; `llama-completion` scores each document through a llama-server `/completion` call and reads P(yes) from the first generated token's logprobs (Qwen3-Reranker judge template) |
-| `PRIORART_RERANK_QUERY_FORMAT` | `instruct` | Rerank query contract for the `openai` protocol: `instruct` wraps the query in manual `<Instruct>`/`<Query>` tags; `raw` passes the query unchanged to endpoints whose template formats it (llama-server `/v1/rerank`) |
-| `PRIORART_CANDIDATE_LIMIT` | `50` | Fused (FTS + dense, RRF) symbols entering the rerank pool |
-| `PRIORART_DB` | `~/.priorart/index.db` | SQLite index path |
-
-Service-specific settings override the shared provider. Keep real values in an
-ignored `.env` file; `.env.example` contains only placeholders.
-
-## CLI
-
-```bash
-set -a; source .env; set +a
-uv run priorart index /path/to/repository [--rebuild]
-uv run priorart search "retry failed provider calls" --repo /path/to/repository
-uv run priorart status --repo /path/to/repository
-uv run priorart serve [--repo /path/to/repository]
+```toml
+[mcp_servers.priorart]
+command = "/absolute/path/to/uv"
+args = ["run", "--project", "/absolute/path/to/priorart", "priorart", "serve"]
+cwd = "/"
 ```
 
-`serve` without `--repo` resolves the Git root from its process working
-directory. Use `uv run --project /path/to/priorart`; `uv --directory` changes
-the process working directory and breaks repository auto-detection.
+Restart Codex after changing its configuration. The server deliberately works
+from any process `cwd`; each repository-scoped call selects its target with an
+absolute `repo` argument. See the official
+[Codex MCP configuration](https://developers.openai.com/docs/extend/mcp) for
+additional client settings.
 
-## MCP configuration
+### 3. Give the agent this repository instruction
 
-Example local MCP entry:
+```text
+Before creating a function, class, or module, call Priorart search_codebase
+with the absolute repository root. Prefer importing, extending, or refactoring
+a relevant existing symbol. Read the referenced source before reuse. If the
+index is absent, call refresh_index once, poll get_index_job until
+lexical_ready is true, and then search. A new worktree has its own index.
+```
 
-```json
+### 4. First-run tool flow
+
+An agent should execute this sequence:
+
+1. Optionally call `list_workspaces` to discover configured or previously
+   indexed paths. Discovery never changes the selected workspace.
+2. Call `refresh_index` with `repo="/absolute/path/to/repository"`.
+3. Save `data.job.job_id`. `data.submission` is `started` for a new job or
+   `joined` when an equivalent refresh is already active.
+4. Poll `get_index_job` with the same `repo` and `job_id` until
+   `data.job.lexical_ready` is `true`. Search can start while embeddings are
+   still running.
+5. Call `search_codebase` with the same absolute `repo`.
+
+Do not refresh before every search. The shared coordinator keeps jobs, file
+watchers, and model caches alive when an MCP stdio client restarts. A separate
+Git worktree is a separate workspace and needs one initial refresh.
+
+## Use Priorart from another MCP client
+
+Use the equivalent stdio definition for clients that accept JSON:
+
+```json mcp-config
 {
-  "mcp": {
+  "mcpServers": {
     "priorart": {
-      "type": "local",
-      "command": [
-        "/bin/sh", "-c",
-        "set -a; . /path/to/priorart/.env; exec uv run --project /path/to/priorart priorart serve"
+      "command": "/absolute/path/to/uv",
+      "args": [
+        "run", "--project", "/absolute/path/to/priorart",
+        "priorart", "serve"
       ],
-      "enabled": true
+      "cwd": "/"
     }
   }
 }
 ```
 
-Recommended repository instruction:
+`priorart serve --repo /absolute/path` sets one startup default for clients
+that cannot pass `repo`. Explicit `repo` always wins. Priorart never guesses
+from process `cwd`, the last-used workspace, or the only existing index.
+`priorart serve --embedded` hosts jobs inside the stdio process and is intended
+only for development and tests.
 
-```text
-Before creating a function, class, or module, call priorart search_codebase.
-Prefer importing, extending, or refactoring a relevant existing symbol. Read
-the referenced file before reuse. If no candidate fits, explain why.
+## MCP interface
+
+Every tool returns human-readable text in `content` plus a machine envelope
+in `structuredContent`; the two never duplicate each other. All envelopes
+contain `ok` and `repo`; successful calls add `index`, `data`, `warnings`,
+and `timings`, while failed calls add `error` and set `is_error=true`.
+Repository paths are canonicalized, so a subdirectory or symlink alias
+resolves to its owning worktree. Another worktree cannot inspect or cancel
+that workspace's job.
+
+The primary contract is `tools/list`: `search_codebase` publishes its input
+schema (enums, defaults, descriptions, examples, `k` minimum) and a
+top-level success `outputSchema` describing the whole envelope. Error
+results keep the separate `is_error=true` shape `{ok: false, repo, error}`.
+Read the schema instead of guessing argument values.
+
+| Tool | Important inputs | Result and use |
+| --- | --- | --- |
+| `search_codebase` | `query`, absolute `repo`, `k`, `mode`, `intent` | Ranked symbols with path, line, signature, role, stages, and degradation reasons |
+| `map_symbols` | absolute `repo`, `path_glob`, `limit`, `cursor` | Paginated symbol inventory for a path or component |
+| `refresh_index` | absolute `repo`, optional `rebuild`, optional `paths` | Non-blocking job plus `submission: started\|joined` |
+| `get_index_job` | absolute `repo`, `job_id` | Job phase, counters, lexical/dense readiness, epoch, and structured failure |
+| `cancel_index_job` | absolute `repo`, `job_id` | Requests cancellation of the shared repo-scoped job; a joined caller can cancel it for all participants |
+| `get_index_status` | absolute `repo` | Live HEAD/file freshness plus lexical, dense, and parse coverage |
+| `list_workspaces` | none | Discovery-only configured and known-indexed workspace paths |
+
+Search modes:
+
+- `fast`: exact and lexical retrieval without optional model stages;
+- `balanced`: hybrid retrieval and configured reranking within one deadline;
+- `deep`: expansion plus all configured retrieval stages.
+
+Exact symbol or qualname matches are dispatched automatically in `fast` and
+`balanced`; `exact` is not a separate mode value.
+
+Search intents are `implementation`, `tests`, and `any`. `implementation`
+prefers production symbols over comparable test helpers; `tests` returns test
+symbols only. An explicitly requested exact test qualname remains findable.
+
+Search results are ranked discovery hints, not a complete reference or call
+graph: a missing candidate does not prove the code is absent. Verify
+exhaustive callers and references by reading files and text or language
+search. One MCP session may issue several tool calls concurrently; each
+operation uses its own daemon connection, so parallel searches run in
+parallel.
+
+Stable `degradation_reasons` are `DENSE_INDEX_PARTIAL`,
+`PARSE_COVERAGE_PARTIAL`, `QUERY_MODEL_UNAVAILABLE`, `RERANK_FALLBACK`, and
+`DEADLINE_FALLBACK`. Intentional omissions in `fast` or a successful exact
+dispatch are not degradation.
+
+## Errors and recovery
+
+Tool-call errors use stable `error.code` values and include `next_action` when
+the caller can recover. `INVALID_ARGUMENT` carries an ordered `violations`
+list (`field`, `input`, `accepted`) covering every invalid argument at once —
+correct them all and retry once. Arguments are checked in two layers: the
+published schema rejects values of the wrong JSON type (a string where an
+integer is declared) with a framework validation message, while type-correct
+but invalid values (an unknown `mode`, `k=0`, `limit=0`) return the
+structured `INVALID_ARGUMENT` envelope. A failed or interrupted background
+job is still a successful job lookup; inspect `data.job.failure` for `code`,
+`message`, `retryable`, and `next_action`.
+
+| Code | Agent action |
+| --- | --- |
+| `REPOSITORY_NOT_SELECTED` | Retry with an absolute `repo`, or configure one `--repo` startup default |
+| `INDEX_NOT_READY` | Call `refresh_index`, then poll until `lexical_ready` |
+| `INVALID_ARGUMENT` | Read each `violations[]` entry, correct every listed argument, and retry |
+| `WRITER_BUSY` | Wait for the external writer to finish, then retry `refresh_index` |
+| `REFRESH_FAILED` | Read the failure message, correct the cause, and submit another refresh |
+| `JOB_INTERRUPTED` | The daemon restarted; keep a published lexical epoch if present and submit a refresh to finish |
+| `DAEMON_PROFILE_MISMATCH` | Stop the existing Priorart daemon using that socket, then reconnect; the MCP client starts one with the current config |
+| `DAEMON_MISMATCH` | Stop the older/incompatible Priorart daemon after an upgrade, then reconnect. If the message says the refresh outcome is unknown, the first refresh may have started: call `refresh_index` again to join or restart it |
+
+Run diagnostics without printing secrets:
+
+```bash
+uv run --project /absolute/path/to/priorart priorart doctor \
+  --repo /absolute/path/to/repository
 ```
 
-## Index behavior
+It reports the effective runtime mode, daemon socket, service-profile
+fingerprint, package versions, provider health, and selected index state.
 
-- Files come from `git ls-files`; non-Git directories use a filtered filesystem
-  walk.
-- Symlinks are skipped, so indexing cannot read source outside the repository.
-- Dirty tracked files are indexed from the current working tree.
-- Each checkout or worktree path has separate index metadata. Refresh a new
-  worktree once before searching it.
-- `status` compares indexed and current HEADs, checks file drift and dirty state,
-  and reports vector coverage.
-- Embedding failures leave a file pending so a later refresh retries it.
+## Configuration
 
-The embedding profile — model, vector dimension and input format — is recorded in
-the index metadata. Changing any of it (`PRIORART_EMBED_MODEL`,
-`PRIORART_EMBED_DIM`, `PRIORART_EMBED_INPUT_FORMAT`) resets the index and the
-next refresh re-embeds everything; keeping stale vectors would silently mix
-two incompatible vector spaces. The index database is a throwaway artifact
-rebuildable by re-indexing.
+Priorart reads `PRIORART_*` environment variables, then
+`~/.priorart/priorart.env`, or a file passed with `priorart serve --config`.
+Real environment variables have highest priority. There is no project-local
+`.env` lookup, so configuration does not change with `cwd` or selected repo.
 
-## Language coverage
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PRIORART_INDEX_DIR` | `~/.priorart/indexes` | Root containing one derived SQLite index per canonical worktree and profile |
+| `PRIORART_DAEMON_SOCKET` | `~/.priorart/daemon.sock` | Shared coordinator Unix socket |
+| `PRIORART_WATCH_INTERVAL` | `2.0` | Source polling interval; `0` disables auto-refresh |
+| `PRIORART_SEARCH_DEADLINE_SECONDS` | `15.0` | End-to-end optional-stage search budget |
+| `PRIORART_CANDIDATE_LIMIT` | `50` | Fused candidates entering reranking |
+| `PRIORART_BASE_URL` / `PRIORART_API_KEY` | empty | Shared provider endpoint and bearer token |
+| `PRIORART_LLM_BASE_URL` / `PRIORART_LLM_API_KEY` / `PRIORART_LLM_MODEL` | shared / empty | Query expansion provider |
+| `PRIORART_EMBED_BASE_URL` / `PRIORART_EMBED_API_KEY` / `PRIORART_EMBED_MODEL` | shared / empty | Embedding provider |
+| `PRIORART_EMBED_DIM` | `1024` | Stored vector dimension; must match provider output |
+| `PRIORART_EMBED_INPUT_FORMAT` | `instruct-text` | `instruct-text` or `qwen3` input contract |
+| `PRIORART_RERANK_BASE_URL` / `PRIORART_RERANK_API_KEY` / `PRIORART_RERANK_MODEL` | shared / empty | Reranking provider |
+| `PRIORART_RERANK_PROTOCOL` | `openai` | `openai` or `llama-completion` wire protocol |
+| `PRIORART_RERANK_QUERY_FORMAT` | `instruct` | `instruct` or `raw` query contract |
 
-Symbol node types are maintained per tree-sitter grammar. Python docstrings are
-extracted from the first body statement. Other languages currently index names,
-signatures, paths, and source ranges; language-specific documentation comments
-and some declaration forms may require additional extractors.
+Service-specific endpoints and keys override the shared provider values.
+Changing the embedding model, dimension, or input format creates a new derived
+profile. Index databases are disposable artifacts; source files remain the
+only source of truth.
 
-## Quality evaluation
+## Index and search behavior
 
-The generic runner in [`benchmarks/`](benchmarks/) evaluates a frozen repository
-against intent queries with verified `path + qualname` answers. It reports
-recall@k, MRR@k, latency, warnings, and the deeper reranked candidate list.
+- Git repositories index `git ls-files`; dirty tracked content is read from the
+  working tree. Non-Git directories use a filtered filesystem walk.
+- Symlinks are skipped during capture so indexing cannot read source outside
+  the repository.
+- The lexical epoch is committed atomically and becomes searchable before
+  optional embeddings finish.
+- Source freshness (HEAD/file drift) is independent from dense and parse
+  coverage. Partial vectors do not make unchanged source stale.
+- The index supports Python, TypeScript/JavaScript, Go, Rust, Java, Ruby, PHP,
+  C, C++, and C# through tree-sitter symbol extraction.
+- SQLite FTS5 provides lexical search; sqlite-vec, query expansion, and
+  reranking enhance it when configured.
+
+## CLI
+
+The CLI is useful for diagnostics and manual indexing:
+
+```bash
+uv run priorart index /absolute/path/to/repository
+uv run priorart search "retry failed provider calls" --repo /absolute/path/to/repository
+uv run priorart status --repo /absolute/path/to/repository
+uv run priorart workspaces
+```
+
+## Quality evaluation and development
+
+The generic runner in [`benchmarks/`](benchmarks/) evaluates a frozen repo
+against verified `path + qualname` answers:
 
 ```bash
 uv run python benchmarks/run.py \
@@ -140,10 +241,8 @@ uv run python benchmarks/run.py \
   --label local-model
 ```
 
-Keep proprietary repositories, issue text, and benchmark results outside the
-public tree or under an ignored directory such as `.bench/`.
-
-## Development
+Keep proprietary inputs and results outside the public tree or in ignored
+directories such as `.bench/` and `scratch/`.
 
 ```bash
 uv run pytest -q
@@ -151,5 +250,5 @@ uv run ruff check .
 ```
 
 `tree-sitter` is pinned below 0.26 because newer releases have caused parser
-crashes on large repositories in this environment. The project uses Python
-3.14 because the selected runtime build includes SQLite FTS5.
+crashes on large repositories in this environment. The recommended runtime is
+Python 3.14 with SQLite FTS5 support.

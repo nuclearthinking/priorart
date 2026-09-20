@@ -1,8 +1,8 @@
-"""Index status: the published-state snapshot and staleness of one repo.
+"""Index status: cheap publication metadata and opt-in live freshness.
 
-Split from the search pipeline: status is a read-only observational concern
-(schema counts, HEAD comparison, file drift), while search.py owns ranking.
-Composers and adapters get both through the retrieval package surface.
+``published_summary`` reads only the index store and is safe for refresh/job
+responses. ``status_summary`` adds Git and file observations for an explicit
+status request. Dense coverage never changes source freshness.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ class IndexSummary:
     working_tree_dirty: bool = False
     stale_reasons: list[str] = field(default_factory=list)
     parse_counts: dict[str, int] = field(default_factory=dict)
+    dense_enabled: bool = True
 
     @property
     def freshness(self) -> str:
@@ -53,9 +54,15 @@ class IndexSummary:
             "source_kind": "working_tree",
             "working_tree_dirty": self.working_tree_dirty,
             "freshness": self.freshness,
-            "lexical": {"state": "ready" if self.symbols or self.files else "empty"},
+            "lexical": {"state": "ready" if self.epoch else "absent"},
             "dense": {
-                "state": "ready" if self.vectorized == self.symbols else "partial",
+                "state": (
+                    "disabled"
+                    if not self.dense_enabled
+                    else "ready"
+                    if self.vectorized == self.symbols
+                    else "partial"
+                ),
                 "ready": self.vectorized,
                 "eligible": self.symbols,
             },
@@ -78,6 +85,7 @@ class IndexSummary:
             working_tree_dirty=payload.get("working_tree_dirty", False),
             stale_reasons=payload.get("stale_reasons", []),
             parse_counts=payload.get("parse_counts", {}),
+            dense_enabled=payload.get("dense", {}).get("state") != "disabled",
         )
 
 
@@ -103,10 +111,9 @@ def published_file_state(conn, repo: str) -> dict[str, tuple[int, int, str]]:
     return {path: (mtime_ns, size, digest) for path, mtime_ns, size, digest in rows}
 
 
-def status_summary(conn, repo: str, *, dense: bool = True) -> IndexSummary:
-    """One-transaction snapshot of the published index plus live observations."""
-    root = Path(repo)
-    summary = IndexSummary(repo=repo, state="ready")
+def published_summary(conn, repo: str, *, dense: bool = True) -> IndexSummary:
+    """Read published index metadata without touching Git or source files."""
+    summary = IndexSummary(repo=repo, state="ready", dense_enabled=dense)
     conn.execute("BEGIN")
     try:
         head, indexed_at, epoch = repo_meta(conn, repo)
@@ -132,27 +139,32 @@ def status_summary(conn, repo: str, *, dense: bool = True) -> IndexSummary:
         conn.execute("ROLLBACK")
         raise
     conn.execute("COMMIT")
+    if not summary.epoch:
+        summary.state = "absent"
+        summary.stale_reasons.append("not indexed")
+    return summary
+
+
+def status_summary(conn, repo: str, *, dense: bool = True) -> IndexSummary:
+    """Add live source freshness observations to published metadata."""
+    root = Path(repo)
+    summary = published_summary(conn, repo, dense=dense)
     summary.head_observed = git_output(root, "rev-parse", "HEAD")
     summary.working_tree_dirty = git_output(root, "status", "--porcelain") is not None
-    if summary.files == 0 and summary.symbols == 0:
-        summary.stale_reasons.append("not indexed")
+    if not summary.epoch:
         return summary
-    if summary.head_observed and head != summary.head_observed:
+    if summary.head_observed and summary.head_at_capture != summary.head_observed:
         summary.stale_reasons.append("HEAD moved since indexing")
     gone, changed = _file_drift(conn, repo, root)
     if gone:
         summary.stale_reasons.append(f"{gone} indexed files no longer present")
     if changed:
         summary.stale_reasons.append(f"{changed} files changed since indexing")
-    if dense and summary.vectorized < summary.symbols:
-        summary.stale_reasons.append(
-            f"{summary.symbols - summary.vectorized} symbols without vectors"
-        )
     return summary
 
 
-def status_text(conn, repo: str, *, dense: bool = True) -> str:
-    summary = status_summary(conn, repo, dense=dense)
+def format_status(summary: IndexSummary) -> str:
+    """Render one summary as text; no second read, no torn snapshot."""
     lines = [
         f"repo: {summary.repo}",
         f"index_head: {summary.head_at_capture or '-'} | current_head: {summary.head_observed or '-'}",
@@ -175,6 +187,10 @@ def status_text(conn, repo: str, *, dense: bool = True) -> str:
     if summary.indexed_at:
         lines.append(f"indexed: {age(time.time() - summary.indexed_at)} ago")
     return "\n".join(lines)
+
+
+def status_text(conn, repo: str, *, dense: bool = True) -> str:
+    return format_status(status_summary(conn, repo, dense=dense))
 
 
 def repo_meta(conn, repo: str) -> tuple[str | None, float | None, int | None]:

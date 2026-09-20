@@ -46,6 +46,12 @@ BODY_MAX_CHARS = 3000
 EXPANSION_LIMIT = 50
 EXPANSION_FILE_QUOTA = 3
 
+DENSE_INDEX_PARTIAL = "DENSE_INDEX_PARTIAL"
+PARSE_COVERAGE_PARTIAL = "PARSE_COVERAGE_PARTIAL"
+QUERY_MODEL_UNAVAILABLE = "QUERY_MODEL_UNAVAILABLE"
+RERANK_FALLBACK = "RERANK_FALLBACK"
+DEADLINE_FALLBACK = "DEADLINE_FALLBACK"
+
 # "empty" is a clean parse of a symbol-free file, not a problem; "embed_failed"
 # leaves stale symbols behind and must stay visible.
 _PARSE_ISSUE_STATUSES = frozenset({"partial", "error", "unsupported", "unreadable"})
@@ -142,6 +148,7 @@ class SearchReport:
     pool: list[Candidate] | None = None
     epoch: int | None = None
     degraded: bool = False
+    degradation_reasons: list[str] = field(default_factory=list)
     stages_used: list[str] = field(default_factory=list)
 
     def payload(self) -> dict:
@@ -155,6 +162,7 @@ class SearchReport:
             "repo": self.repo,
             "current_head": self.current_head,
             "degraded": self.degraded,
+            "degradation_reasons": list(self.degradation_reasons),
             "stages_used": self.stages_used,
             "epoch": self.epoch,
             "parse_coverage": self.parse_coverage,
@@ -187,6 +195,7 @@ class SearchReport:
             parse_coverage=payload.get("parse_coverage"),
             epoch=payload.get("epoch"),
             degraded=payload.get("degraded", False),
+            degradation_reasons=payload.get("degradation_reasons", []),
             stages_used=payload.get("stages_used", []),
         )
 
@@ -220,7 +229,7 @@ def vec_search(conn, repo: str, vector, limit: int = 50) -> list[int]:
     return [row[0] for row in rows]
 
 
-def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-stage collaborators
+def search(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 - explicit retrieval stages
     conn,
     repo: str,
     query: str,
@@ -255,6 +264,7 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
     """
     limit = CANDIDATE_LIMIT if candidate_limit is None else candidate_limit
     warnings: list[str] = []
+    degradation_reasons: list[str] = []
     stage_seconds: dict[str, float] = {}
     started = time.perf_counter()
     if exact_dispatch:
@@ -265,7 +275,9 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
             exact = [row for row in exact if row[_ROLE_COLUMN] in ("test", "fixture")]
         if exact:
             stage_seconds["exact"] = time.perf_counter() - started
-            return _exact_report(conn, repo, query, k, exact, stage_seconds, warnings)
+            return _exact_report(
+                conn, repo, query, k, exact, stage_seconds, warnings, intent=intent
+            )
     deadline = None if deadline_seconds is None else time.monotonic() + deadline_seconds
     # the deadline covers generative expansion too, not only embedding and
     # reranking: a slow expander must not overrun the budget
@@ -283,8 +295,13 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
             query_space_id,
             dense_expected=dense_expected,
         )
-    if deadline is not None and time.monotonic() > deadline and query_vectors:
-        warnings.append("search deadline exhausted before retrieval; dense channel skipped")
+    # A budget timeout can return no vectors, so classification must use the
+    # monotonic deadline rather than the result or provider warning text.
+    dense_skipped_for_deadline = deadline is not None and time.monotonic() >= deadline
+    if dense_skipped_for_deadline:
+        if query_vectors:
+            warnings.append("search deadline exhausted before retrieval; dense channel skipped")
+        degradation_reasons.append(DEADLINE_FALLBACK)
         query_vectors = []
     started = time.perf_counter()
     retrieval = _retrieve(conn, repo, query, queries, query_vectors, pool_expansion, limit)
@@ -295,6 +312,12 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
             "(index built without embeddings or with a different embedding "
             "profile); rerun priorart index with embeddings configured"
         )
+    if dense_expected and not query_vectors and not dense_skipped_for_deadline:
+        degradation_reasons.append(QUERY_MODEL_UNAVAILABLE)
+    if dense_expected and retrieval.vectorized_count < retrieval.symbol_count:
+        degradation_reasons.append(DENSE_INDEX_PARTIAL)
+    if any(retrieval.parse_coverage.get(status, 0) for status in _PARSE_ISSUE_STATUSES):
+        degradation_reasons.append(PARSE_COVERAGE_PARTIAL)
     pool: list[tuple[int, Candidate]] = []
     for symbol_id, score in retrieval.top:
         row = retrieval.rows.get(symbol_id)
@@ -308,10 +331,23 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
         # explicit test intent restricts the pool; production preference
         # is a ranking prior instead of a filter
         pool = [item for item in pool if item[1].source_role in ("test", "fixture")]
+    rerank_input = [candidate for _symbol_id, candidate in pool]
     with _budgeted_stage(stage_seconds, "rerank", deadline):
-        candidates, rerank_indices = _apply_rerank(
-            [candidate for _symbol_id, candidate in pool], query, rerank_fn, warnings
-        )
+        candidates, rerank_indices = _apply_rerank(rerank_input, query, rerank_fn, warnings)
+    rerank_skipped_for_deadline = (
+        rerank_fn is not None
+        and bool(pool)
+        and deadline is not None
+        and time.monotonic() >= deadline
+    )
+    if rerank_skipped_for_deadline:
+        warnings.append("search deadline exhausted during reranking; kept deterministic order")
+        candidates = _fallback_rank(rerank_input, query)
+        rerank_indices = None
+        degradation_reasons.append(DEADLINE_FALLBACK)
+    if rerank_fn is not None and pool and rerank_indices is None:
+        degradation_reasons.append(RERANK_FALLBACK)
+    degradation_reasons = list(dict.fromkeys(degradation_reasons))
     if intent == "implementation":
         candidates = _prefer_production(candidates)
     rerank_order = (
@@ -338,7 +374,8 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
         parse_coverage=retrieval.parse_coverage,
         pool=candidates,
         epoch=retrieval.epoch,
-        degraded=dense_expected and not query_vectors,
+        degraded=bool(degradation_reasons),
+        degradation_reasons=degradation_reasons,
         stages_used=["lexical", *(["dense"] if query_vectors else [])],
     )
 
@@ -468,9 +505,11 @@ def _exact_match(conn, repo: str, query: str) -> list[tuple]:
 
 
 def _exact_report(  # noqa: PLR0913, PLR0917 - report construction takes the full context
-    conn, repo, query, k, rows, stage_seconds, warnings
+    conn, repo, query, k, rows, stage_seconds, warnings, *, intent
 ) -> SearchReport:
     candidates = [_candidate_from_row(row, 1.0) for row in rows]
+    if intent == "implementation":
+        candidates = _prefer_production(candidates)
     head, indexed_at, epoch = repo_meta(conn, repo)
     symbol_count = _symbol_count(conn, repo)
     return SearchReport(
@@ -494,6 +533,7 @@ def _exact_report(  # noqa: PLR0913, PLR0917 - report construction takes the ful
         parse_coverage={},
         epoch=epoch,
         degraded=False,
+        degradation_reasons=[],
         stages_used=["exact"],
     )
 

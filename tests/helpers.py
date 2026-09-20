@@ -113,11 +113,13 @@ class DaemonFixture:
             self.refused = True
 
     def __enter__(self):
-        from priorart.coordinator import DaemonClient, RemoteRegistry
+        from priorart.coordinator import DaemonClient, RemoteRegistry, profile_fingerprint
 
         self.thread.start()
         assert self.ready.wait(timeout=10)
-        self.registry = RemoteRegistry(lambda: DaemonClient(self.socket))
+        self.registry = RemoteRegistry(
+            lambda: DaemonClient(self.socket, profile_fingerprint(self.config))
+        )
         return self.registry
 
     def __exit__(self, *exc_info) -> None:

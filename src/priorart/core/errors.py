@@ -17,7 +17,9 @@ JOB_NOT_FOUND = "JOB_NOT_FOUND"
 JOB_REPOSITORY_MISMATCH = "JOB_REPOSITORY_MISMATCH"
 WORKSPACE_SCOPE_MISMATCH = "WORKSPACE_SCOPE_MISMATCH"
 DAEMON_MISMATCH = "DAEMON_MISMATCH"
+DAEMON_PROFILE_MISMATCH = "DAEMON_PROFILE_MISMATCH"
 HANDLE_CLOSED = "HANDLE_CLOSED"
+INVALID_ARGUMENT = "INVALID_ARGUMENT"
 
 _NEXT_ACTIONS = {
     REPOSITORY_NOT_SELECTED: "Select a repository and repeat this call with repo=<absolute path>.",
@@ -29,14 +31,28 @@ _NEXT_ACTIONS = {
     JOB_REPOSITORY_MISMATCH: "Repeat the call with the repo that owns the job.",
     WORKSPACE_SCOPE_MISMATCH: "Repeat the call with the repo fixed for this session.",
     DAEMON_MISMATCH: "Restart the priorart daemon (priorart daemon) and retry.",
+    DAEMON_PROFILE_MISMATCH: (
+        "Use the same config for this socket, choose another socket, or restart the daemon."
+    ),
     HANDLE_CLOSED: "Retry with a fresh handle (restart the session if daemon-backed).",
+    INVALID_ARGUMENT: "Correct the argument and retry the call.",
 }
 
 _DEFAULT_NEXT_ACTION = "Inspect the error message and adjust the call."
 
 # Error detail keys that are safe to render to clients.
 _RENDERABLE_DETAILS = frozenset(
-    {"candidates", "input", "job_id", "repo", "stored_profile", "requested_profile"}
+    {
+        "accepted",
+        "candidates",
+        "field",
+        "input",
+        "job_id",
+        "repo",
+        "stored_profile",
+        "requested_profile",
+        "violations",
+    }
 )
 
 

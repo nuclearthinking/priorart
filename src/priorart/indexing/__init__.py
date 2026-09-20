@@ -5,6 +5,7 @@ Public surface: ``Symbol``, ``ParseResult``, ``parse_source``,
 ``preflight_parsers``, ``language_of``, ``LANGS``, ``capture_file``,
 ``list_source_files``, ``repo_languages``, ``head_revision``,
 ``InventoryError``, ``index_repo``, ``RefreshCancelledError``, ``JobManager``,
+``journal_job``,
 ``start_watcher``.
 """
 
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 from .capture import capture_file
 from .inventory import InventoryError, head_revision, list_source_files, repo_languages
-from .jobs import JobManager
+from .jobs import JobManager, journal_job
 from .parser import (
     LANGS,
     ParseResult,
@@ -34,6 +35,7 @@ __all__ = [
     "capture_file",
     "head_revision",
     "index_repo",
+    "journal_job",
     "language_of",
     "list_source_files",
     "parse_source",

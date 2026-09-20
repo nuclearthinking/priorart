@@ -153,7 +153,8 @@ def test_worker_survives_persist_failure(tmp_path, monkeypatch):
         second = registry.submit_refresh(handle)
         second = wait_job(registry, second.job_id)
         assert second.state == "failed"
-        assert "journal write failed" in (second.error or "")
+        assert second.failure["code"] == "REFRESH_FAILED"
+        assert "journal write failed" in second.failure["message"]
 
         # the worker is still alive: a third job runs to completion
         third = registry.submit_refresh(handle)

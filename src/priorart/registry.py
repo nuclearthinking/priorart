@@ -5,6 +5,8 @@ lock protects only lookup/creation and never spans git, SQL, parsing or
 inference. Model clients are shared across handles (one service profile),
 and every reader call opens its own connection — there is no shared
 mutable connection whose transaction one call could roll back for another.
+Search arguments are validated once here through the core vocabulary, so
+the embedded and daemon paths return the same structured errors.
 """
 
 from __future__ import annotations
@@ -22,15 +24,17 @@ from .core import (
     Job,
     PriorartError,
     resolve_repo,
+    validate_map_request,
+    validate_search_request,
 )
-from .indexing.jobs import JobManager, journal_job
-from .models import ModelClients, embedding_space_id
-from .models.embed_cache import EmbedCache
+from .indexing import JobManager, journal_job
+from .models import EmbedCache, ModelClients, embedding_space_id
 from .retrieval import (
     IndexSummary,
     map_symbols_rows,
     published_epoch,
     published_file_state,
+    published_summary,
     search,
     status_summary,
     status_text,
@@ -118,8 +122,8 @@ class RepoHandle:
     def search(
         self, query: str, k: int = 10, mode: str = "balanced", intent: str = "implementation"
     ):
-        _require_choice(mode, _MODES, "mode")
-        _require_choice(intent, _INTENTS, "intent")
+        # one structured guard shared by the embedded and daemon paths
+        validate_search_request(k, mode, intent)
         reader = self.reader()
         if reader is None or not published_epoch(reader, str(self.root)):
             if reader is not None:
@@ -176,6 +180,7 @@ class RepoHandle:
             reader.close()
 
     def map_symbols(self, path_glob: str, limit: int = 100, offset: int = 0):
+        validate_map_request(limit)
         reader = self.reader()
         if reader is None:
             raise PriorartError(
@@ -190,12 +195,25 @@ class RepoHandle:
 
     def index_metadata(self) -> dict:
         """Light published-state block for response envelopes."""
-        summary = self.status()
-        return summary.payload()
+        reader = self.reader()
+        if reader is None:
+            return IndexSummary(repo=str(self.root), state="absent").payload()
+        try:
+            return published_summary(
+                reader, str(self.root), dense=self.models.dense_enabled
+            ).payload()
+        finally:
+            reader.close()
 
     # -- writer and jobs ---------------------------------------------------
 
-    def refresh(self, *, rebuild: bool = False, paths: list[str] | None = None) -> Job:
+    def refresh(
+        self,
+        *,
+        rebuild: bool = False,
+        paths: list[str] | None = None,
+        include_submission: bool = False,
+    ) -> Job | tuple[Job, str]:
         """Submit an indexing job; returns immediately with the job."""
         with self._init_mutex:
             if self._closed:
@@ -219,7 +237,9 @@ class RepoHandle:
                     embed_cache=self.embed_cache,
                     embed_space_id=self.embed_space_id,
                 )
-        return self._jobs.submit(rebuild=rebuild, paths=paths)
+        return self._jobs.submit(
+            rebuild=rebuild, paths=paths, include_submission=include_submission
+        )
 
     def _journal_job(self, job_id: str) -> Job | None:
         """Job row from the on-disk journal (for restarted services)."""
@@ -256,19 +276,6 @@ class RepoHandle:
             jobs.shutdown()
 
 
-_MODES = ("fast", "balanced", "deep")
-_INTENTS = ("implementation", "tests", "any")
-
-
-def _require_choice(value: str, choices: tuple[str, ...], field: str) -> None:
-    if value not in choices:
-        raise ValueError(f"{field} must be one of {', '.join(choices)}; got {value!r}")
-
-
-def _job_not_found(job_id: str) -> None:
-    raise PriorartError(JOB_NOT_FOUND, f"no job {job_id} in this service.", job_id=job_id)
-
-
 class RuntimeRegistry:
     """Resolves repositories to handles; never guesses the workspace."""
 
@@ -277,12 +284,10 @@ class RuntimeRegistry:
         config: Config | None = None,
         *,
         default_repos: Iterable[Path] = (),
-        context_repos: Iterable[Path] = (),
     ) -> None:
         self.config = config or Config()
         self.models = ModelClients(self.config)
         self._defaults = [Path(repo) for repo in default_repos]
-        self._context = [Path(repo) for repo in context_repos]
         self._handles: dict[Path, RepoHandle] = {}
         self._cache: EmbedCache | None = None
         self._job_owners: dict[str, RepoHandle] = {}
@@ -290,9 +295,15 @@ class RuntimeRegistry:
 
     def resolve(self, repo: Path | str | None = None) -> RepoHandle:
         """Select exactly one repository for this call and return its handle."""
+        if repo is not None:
+            candidate = Path(repo)
+            if candidate.is_absolute() and candidate.exists():
+                with self._mutex:
+                    cached = self._handles.get(candidate.resolve())
+                if cached is not None:
+                    return cached
         resolved = resolve_repo(
             explicit=Path(repo) if repo is not None else None,
-            context=self._context,
             defaults=self._defaults,
         )
         return self._handle(resolved.root)
@@ -317,49 +328,87 @@ class RuntimeRegistry:
         return self._cache
 
     def submit_refresh(
-        self, handle: RepoHandle, *, rebuild: bool = False, paths: list[str] | None = None
-    ) -> Job:
-        job = handle.refresh(rebuild=rebuild, paths=paths)
+        self,
+        handle: RepoHandle,
+        *,
+        rebuild: bool = False,
+        paths: list[str] | None = None,
+        include_submission: bool = False,
+    ) -> Job | tuple[Job, str]:
+        result = handle.refresh(rebuild=rebuild, paths=paths, include_submission=include_submission)
+        job = result[0] if include_submission else result
         with self._mutex:
             self._job_owners[job.job_id] = handle
-        return job
+        return result
 
     def get_job(self, job_id: str, repo: Path | str | None = None) -> tuple[RepoHandle, Job]:
-        """Look up a job; an explicit repo must match the job's owner."""
+        """Look up a job inside the explicitly resolved canonical repository."""
         with self._mutex:
-            handle = self._job_owners.get(job_id)
-        if handle is None and repo is not None:
-            # a restarted service has no in-memory owner: the journal row is
-            # the honest answer (reconciled as interrupted when mid-run)
-            fallback = self.resolve(repo)._journal_job(job_id)
-            if fallback is not None:
-                return self.resolve(repo), fallback
-        if handle is None:
-            _job_not_found(job_id)
-        if repo is not None and str(Path(repo)) != str(handle.root):
+            owner = self._job_owners.get(job_id)
+        requested = self._job_requested_handle(repo, owner)
+        if owner is not None and owner.root != requested.root:
             raise PriorartError(
                 JOB_REPOSITORY_MISMATCH,
-                f"job {job_id} belongs to {handle.root}, not {repo}.",
+                f"job {job_id} belongs to {owner.root}, not {requested.root}.",
                 job_id=job_id,
-                repo=str(handle.root),
+                repo=str(owner.root),
+                resolved_repo=str(requested.root),
             )
-        job = handle.job(job_id)
+        if owner is None:
+            live = requested.job(job_id)
+            if live is not None:
+                with self._mutex:
+                    self._job_owners[job_id] = requested
+                return requested, live
+            # a restarted service has no in-memory owner: the journal row is
+            # the honest answer (reconciled as interrupted when mid-run)
+            fallback = requested._journal_job(job_id)
+            if fallback is not None:
+                return requested, fallback
+        if owner is None:
+            raise PriorartError(
+                JOB_NOT_FOUND,
+                f"No indexing job {job_id} exists.",
+                job_id=job_id,
+                resolved_repo=str(requested.root),
+            )
+        job = owner.job(job_id)
         if job is None:
-            _job_not_found(job_id)
-        return handle, job
+            raise PriorartError(
+                JOB_NOT_FOUND,
+                f"No indexing job {job_id} exists.",
+                job_id=job_id,
+                resolved_repo=str(requested.root),
+            )
+        return owner, job
+
+    def _job_requested_handle(self, repo, owner: RepoHandle | None) -> RepoHandle:
+        """Resolve a job repo, reusing only a proven canonical owner root."""
+        if repo is not None and owner is not None:
+            candidate = Path(repo)
+            if candidate == owner.root:
+                return owner
+            if candidate.is_absolute() and candidate.exists():
+                canonical = candidate.resolve()
+                if canonical == owner.root:
+                    return owner
+        if repo is None and not self._defaults and owner is not None:
+            # Internal callers already holding a submitted Job may omit repo.
+            # Public MCP calls resolve an explicit/default repo before here.
+            return owner
+        return self.resolve(repo)
 
     def cancel_job(self, job_id: str, repo: Path | str | None = None) -> Job:
         """Request cancellation of a job owned by this service."""
-        handle, _job = self.get_job(job_id, repo)
+        handle, job = self.get_job(job_id, repo)
         cancelled = handle.cancel_job(job_id)
         if cancelled is None:
-            _job_not_found(job_id)
+            return job
         return cancelled
 
     def workspaces(self) -> dict:
         """Workspace candidates by origin; never changes any selection."""
         return {
-            "context": [str(Path(repo)) for repo in self._context],
             "configured": [str(Path(repo)) for repo in self._defaults],
             "known_indexed": [str(root) for root in known_roots(self.config.index_dir)],
         }

@@ -92,8 +92,8 @@ class Config(BaseSettings):
     daemon_socket: str | None = Field(
         default=None,
         description=(
-            "Unix socket of the shared coordinator daemon; when set, MCP serve "
-            "becomes a thin client of that process instead of hosting its own registry"
+            "Unix socket of the shared coordinator daemon used by MCP serve; "
+            "the default socket is chosen when this value is absent"
         ),
     )
     rerank_protocol: Literal["openai", "llama-completion"] = Field(

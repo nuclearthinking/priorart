@@ -672,6 +672,9 @@ def test_partial_parse_state_persists_across_refreshes(tmp_path, monkeypatch):
     exact = search(conn, str(repo), "partial", k=3)
     assert exact.stages_used == ["exact"]
     assert exact.candidates[0].qualname == "partial"
+    assert exact.degraded is False
+    assert exact.degradation_reasons == []
+    assert exact.parse_coverage == {}
 
 
 def test_parse_error_state_persists_and_retries(tmp_path, monkeypatch):

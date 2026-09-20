@@ -45,7 +45,6 @@ def _wait_jobs(registry: RuntimeRegistry, repo: Path):
 
 def test_deadline_skips_dense_channel_with_warning(tmp_path, monkeypatch):
     repo = _repo_with(tmp_path / "repo")
-    registry = RuntimeRegistry(make_config(tmp_path))
 
     def slow_embed(texts, *, query=False):
         time.sleep(0.05)
@@ -54,6 +53,7 @@ def test_deadline_skips_dense_channel_with_warning(tmp_path, monkeypatch):
     import priorart.models
 
     monkeypatch.setattr(priorart.models, "make_embedder", lambda config: slow_embed)
+    registry = RuntimeRegistry(make_config(tmp_path))
     handle = _wait_jobs(registry, repo)
     reader = handle.reader()
     try:
@@ -69,6 +69,97 @@ def test_deadline_skips_dense_channel_with_warning(tmp_path, monkeypatch):
         reader.close()
     assert report.stages_used == ["lexical"]
     assert any("deadline exhausted" in warning for warning in report.warnings)
+    assert report.degradation_reasons == ["DEADLINE_FALLBACK"]
+
+
+def test_deadline_timeout_without_vectors_is_not_model_unavailable(tmp_path, monkeypatch):
+    repo = _repo_with(tmp_path / "repo")
+
+    def healthy_embed(texts, *, query=False):
+        return [b"\x00\x00\x80?" * 4] * len(texts), None
+
+    import priorart.models
+
+    monkeypatch.setattr(priorart.models, "make_embedder", lambda config: healthy_embed)
+    registry = RuntimeRegistry(make_config(tmp_path))
+    handle = _wait_jobs(registry, repo)
+
+    def timed_out_embed(texts, *, query=False):
+        time.sleep(0.02)
+        return None, "embedding request timed out; dense search skipped"
+
+    reader = handle.reader()
+    try:
+        report = search(
+            reader,
+            str(handle.root),
+            "owner handler",
+            k=5,
+            embed_fn=timed_out_embed,
+            deadline_seconds=0.001,
+        )
+    finally:
+        reader.close()
+        registry.close()
+    assert report.degradation_reasons == ["DEADLINE_FALLBACK"]
+
+
+def test_immediate_embedding_failure_is_model_unavailable_not_deadline(tmp_path, monkeypatch):
+    repo = _repo_with(tmp_path / "repo")
+
+    def healthy_embed(texts, *, query=False):
+        return [b"\x00\x00\x80?" * 4] * len(texts), None
+
+    import priorart.models
+
+    monkeypatch.setattr(priorart.models, "make_embedder", lambda config: healthy_embed)
+    registry = RuntimeRegistry(make_config(tmp_path))
+    handle = _wait_jobs(registry, repo)
+
+    def failed_embed(texts, *, query=False):
+        return None, "embedding provider unavailable; dense search skipped"
+
+    reader = handle.reader()
+    try:
+        report = search(
+            reader,
+            str(handle.root),
+            "owner handler",
+            k=5,
+            embed_fn=failed_embed,
+            deadline_seconds=1.0,
+        )
+    finally:
+        reader.close()
+        registry.close()
+    assert report.degradation_reasons == ["QUERY_MODEL_UNAVAILABLE"]
+
+
+def test_rerank_deadline_uses_typed_reason_not_warning_text(tmp_path):
+    repo = _repo_with(tmp_path / "repo")
+    registry = RuntimeRegistry(make_config(tmp_path))
+    handle = _wait_jobs(registry, repo)
+
+    def slow_rerank(query, documents):
+        time.sleep(0.05)
+        return list(enumerate(range(len(documents)))), None
+
+    reader = handle.reader()
+    try:
+        report = search(
+            reader,
+            str(handle.root),
+            "owner handler",
+            k=5,
+            embed_fn=None,
+            dense_expected=False,
+            rerank_fn=slow_rerank,
+            deadline_seconds=0.01,
+        )
+    finally:
+        reader.close()
+        registry.close()
+    assert report.degradation_reasons == ["DEADLINE_FALLBACK", "RERANK_FALLBACK"]
 
 
 # --- R03 fallback ranking ---------------------------------------------------
@@ -109,6 +200,49 @@ def test_fallback_ranks_expansion_owners_with_fused_candidates(tmp_path):
         # term evidence puts the owner above filler even though hybrid
         # order alone had expansion candidates at score 0
         assert qualnames[0] == "canonicalize_owner"
+    finally:
+        registry.close()
+
+
+def test_partial_dense_is_capability_degradation_not_source_staleness(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path / "repo")
+    (repo / "src_app.py").write_text(
+        "def owner_handler():\n    pass\n\n\ndef second_handler():\n    pass\n"
+    )
+    git(repo, "add", "src_app.py")
+    git(repo, "commit", "-q", "-m", "init")
+
+    def embed(texts, *, query=False):
+        return [b"\x00\x00\x80?" * 4] * len(texts), None
+
+    import priorart.models
+
+    monkeypatch.setattr(priorart.models, "make_embedder", lambda config: embed)
+    registry = RuntimeRegistry(make_config(tmp_path, embed_model="embed"))
+    try:
+        handle = _wait_jobs(registry, repo)
+        writer = handle.reader()
+        symbol_id = writer.execute(
+            "SELECT symbol_id FROM symbols_vec WHERE repo = ? LIMIT 1", (str(handle.root),)
+        ).fetchone()[0]
+        writer.close()
+        from priorart.storage import initialize_writer
+
+        conn = initialize_writer(handle.store, handle.profile)
+        conn.execute("DELETE FROM symbols_vec WHERE symbol_id = ?", (symbol_id,))
+        conn.commit()
+        conn.close()
+
+        summary = handle.status()
+        assert summary.freshness == "fresh"
+        assert summary.payload()["dense"]["state"] == "partial"
+
+        report = handle.search("owner handler", mode="balanced")
+        assert report.degraded
+        assert "DENSE_INDEX_PARTIAL" in report.degradation_reasons
+
+        fast = handle.search("owner handler", mode="fast")
+        assert "DENSE_INDEX_PARTIAL" not in fast.degradation_reasons
     finally:
         registry.close()
 

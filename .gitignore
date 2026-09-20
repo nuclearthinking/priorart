@@ -25,3 +25,4 @@ coverage/
 .coverage.*
 .coveragerc.gremlins
 .pytest_cache/
+docs/

@@ -5,11 +5,10 @@ Resolution order (plan, "Выбор workspace"):
 1. An explicit ``repo`` of the call: validate it, canonicalize to the git
    worktree root. An invalid explicit path is an error; fallback to another
    repository is forbidden.
-2. Workspace context actually supplied by the client for this call.
-3. Explicitly configured default repositories (``serve --repo`` or the
+2. Explicitly configured default repositories (``serve --repo`` or the
    configured workspace list). One candidate may be selected; several demand
    an explicit parameter.
-4. No source at all: ``REPOSITORY_NOT_SELECTED``. The first cached handle,
+3. No source at all: ``REPOSITORY_NOT_SELECTED``. The first cached handle,
    the last used repository, the only indexed repository or the process CWD
    are never used implicitly.
 
@@ -78,7 +77,6 @@ def _canonical_candidates(paths: Iterable[Path]) -> list[Path]:
 def resolve_repo(
     *,
     explicit: Path | None = None,
-    context: Iterable[Path] = (),
     defaults: Iterable[Path] = (),
 ) -> ResolvedRepo:
     """Select exactly one repository for one call."""
@@ -92,9 +90,7 @@ def resolve_repo(
         if root is None:
             raise _invalid(explicit, "the path is not inside a git repository")
         return ResolvedRepo(root=root, input=explicit)
-    candidates = _canonical_candidates(context)
-    if not candidates:
-        candidates = _canonical_candidates(defaults)
+    candidates = _canonical_candidates(defaults)
     if not candidates:
         raise PriorartError(
             REPOSITORY_NOT_SELECTED,

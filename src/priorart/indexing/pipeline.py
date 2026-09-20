@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -45,6 +46,7 @@ EMBED_CHUNK = 64
 
 ProgressFn = Callable[[str, dict], None]
 CancelFn = Callable[[], bool]
+PublicationFn = Callable[[object, dict], None]
 
 
 class RefreshCancelledError(Exception):
@@ -72,6 +74,8 @@ def index_repo(  # noqa: PLR0913 - explicit collaborator set
     should_cancel: CancelFn | None = None,
     embed_cache=None,
     embed_space_id: str = "",
+    publication_guard=None,
+    publication_record: PublicationFn | None = None,
 ) -> dict:
     """Refresh the lexical index atomically, then attach missing vectors.
 
@@ -110,19 +114,41 @@ def index_repo(  # noqa: PLR0913 - explicit collaborator set
     symbols = 0
     warnings: list[str] = []
     _emit(progress, "publishing_lexical", {"total": total, "scanned": scanned})
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        for rel in removed:
-            _drop_file(conn, repo, rel)
-        for item in staged:
-            published = _publish_staged(conn, repo, item, warnings)
-            files += 1 if published else 0
-            symbols += len(item.symbols)
-        epoch = _publish_epoch(conn, repo, head)
-        conn.execute("COMMIT")
-    except BaseException:
-        _rollback(conn)
-        raise
+    with publication_guard if publication_guard is not None else nullcontext():
+        _check_cancelled(should_cancel)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for rel in removed:
+                _drop_file(conn, repo, rel)
+            for item in staged:
+                published = _publish_staged(conn, repo, item, warnings)
+                files += 1 if published else 0
+                symbols += len(item.symbols)
+            epoch = _publish_epoch(conn, repo, head)
+            publication = {
+                "epoch": epoch,
+                "files": files,
+                "symbols": symbols,
+                "removed": len(removed),
+            }
+            if publication_record is not None:
+                # The job's epoch belongs in the same transaction as the
+                # lexical publication. A process death cannot then make an
+                # interrupted job borrow some other repo epoch on recovery.
+                publication_record(conn, publication)
+            conn.execute("COMMIT")
+        except BaseException:
+            _rollback(conn)
+            raise
+
+        # Keep the publication guard until the job journal observes the
+        # committed epoch. A concurrent cancel therefore completes either
+        # before both transitions or after both transitions.
+        _emit(
+            progress,
+            "lexical_published",
+            publication,
+        )
 
     embedded, cache_hits, embed_failures = _attach_missing_vectors(
         conn, repo, embed_fn, should_cancel, progress, warnings, embed_cache, embed_space_id

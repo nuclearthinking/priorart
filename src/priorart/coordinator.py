@@ -12,14 +12,21 @@ Protocol: one JSON object per line, responses mirror the request id.
 Every op returns ``{"id": n, "ok": true, "data": ...}`` or
 ``{"id": n, "ok": false, "error": {code, message, ...details}}``; domain
 errors travel as ``PriorartError`` codes and are re-raised client-side.
-The handshake pins the protocol and the application version: a mismatch is
-a hard refusal, never a best-effort mix.
+The handshake pins the protocol, application version and effective service
+profile: a mismatch is a hard refusal, never a best-effort mix.
+
+Client side: one connection per admitted operation — concurrent callers
+never serialize behind a shared socket. A broken transport link replays
+only provably safe operations (``_REPLAY_SAFE_OPS``); anything else, and
+a refresh in particular, surfaces as a structured uncertain-outcome error
+instead of silently sending a second request.
 """
 
 from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import socket
@@ -29,13 +36,37 @@ import threading
 import time
 from pathlib import Path
 
-from priorart.core import APP_VERSION, DAEMON_MISMATCH, Job, PriorartError
+from priorart.core import (
+    APP_VERSION,
+    DAEMON_MISMATCH,
+    DAEMON_PROFILE_MISMATCH,
+    HANDLE_CLOSED,
+    Job,
+    PriorartError,
+)
 from priorart.registry import RuntimeRegistry
 from priorart.retrieval import IndexSummary, SearchReport
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 3
 DEFAULT_SOCKET = "~/.priorart/daemon.sock"
 _HANDSHAKE_TIMEOUT = 10.0
+
+# Operations whose repeat after a broken transport link is provably safe:
+# reads and the idempotent cancel. ``refresh`` is absent on purpose: a resend
+# could start a second job nobody asked for. Future operations are not
+# retryable until explicitly added here.
+_REPLAY_SAFE_OPS = frozenset(
+    {
+        "resolve",
+        "search",
+        "status",
+        "map_symbols",
+        "metadata",
+        "get_job",
+        "workspaces",
+        "cancel_job",
+    }
+)
 
 
 # --- serialization -----------------------------------------------------------
@@ -80,12 +111,13 @@ def serve(config, socket_path: Path, *, stop_event=None, ready_event=None) -> No
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_fd = _claim_singleton(path)
     registry = RuntimeRegistry(config)
+    fingerprint = profile_fingerprint(config)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
     listener.listen(8)
     listener.settimeout(0.5)
     stop = stop_event if stop_event is not None else threading.Event()
-    connections: list[threading.Thread] = []
+    connections: list[tuple[socket.socket, threading.Thread]] = []
     if ready_event is not None:
         ready_event.set()
     try:
@@ -93,17 +125,24 @@ def serve(config, socket_path: Path, *, stop_event=None, ready_event=None) -> No
             try:
                 conn, _addr = listener.accept()
             except (TimeoutError, OSError):
-                connections = [thread for thread in connections if thread.is_alive()]
+                connections = [item for item in connections if item[1].is_alive()]
                 continue
-            thread = threading.Thread(target=_serve_connection, args=(conn, registry), daemon=True)
+            thread = threading.Thread(
+                target=_serve_connection, args=(conn, registry, fingerprint), daemon=True
+            )
             thread.start()
-            connections.append(thread)
+            connections.append((conn, thread))
     finally:
         listener.close()
-        # in-flight requests must finish before the registry and its caches
-        # are closed underneath them
-        for thread in connections:
-            thread.join(timeout=30)
+        # Stop idle readers from keeping the daemon alive, but leave the
+        # write side available so an in-flight request can finish its reply.
+        # Every handler must exit before shared resources and the singleton
+        # claim are released.
+        for conn, _thread in connections:
+            with contextlib.suppress(OSError):
+                conn.shutdown(socket.SHUT_RD)
+        for _conn, thread in connections:
+            thread.join()
         # unlink only after the drain: a new client may autostart a daemon
         # during the drain window, and removing the socket from under it
         # would orphan it (its flock still held, its socket gone)
@@ -113,7 +152,7 @@ def serve(config, socket_path: Path, *, stop_event=None, ready_event=None) -> No
         os.close(lock_fd)
 
 
-def _serve_connection(conn: socket.socket, registry: RuntimeRegistry) -> None:
+def _serve_connection(conn: socket.socket, registry: RuntimeRegistry, fingerprint: str) -> None:
     with conn:
         reader = conn.makefile("r")
         writer = conn.makefile("w")
@@ -123,7 +162,7 @@ def _serve_connection(conn: socket.socket, registry: RuntimeRegistry) -> None:
                 continue
             try:
                 request = json.loads(line)
-                response = _dispatch(registry, request)
+                response = _dispatch(registry, request, fingerprint)
             except PriorartError as err:
                 response = {
                     "id": _request_id(line),
@@ -148,7 +187,7 @@ def _request_id(line: str):
     return parsed.get("id") if isinstance(parsed, dict) else None
 
 
-def _dispatch(registry: RuntimeRegistry, request: dict) -> dict:
+def _dispatch(registry: RuntimeRegistry, request: dict, fingerprint: str) -> dict:
     op = request.get("op")
     request_id = request.get("id")
     if op == "handshake":
@@ -159,6 +198,11 @@ def _dispatch(registry: RuntimeRegistry, request: dict) -> dict:
                 "restart it (priorart daemon)",
                 daemon_protocol=request.get("protocol"),
                 daemon_app_version=request.get("app_version"),
+            )
+        if request.get("profile") != fingerprint:
+            raise PriorartError(
+                DAEMON_PROFILE_MISMATCH,
+                "the priorart daemon uses a different effective service configuration",
             )
         return {"id": request_id, "ok": True, "data": {"app_version": APP_VERSION}}
     payload = _OPS[op](registry, request) if op in _OPS else None
@@ -188,11 +232,6 @@ def _op_status(registry, request):
     return handle.status().payload()
 
 
-def _op_status_text(registry, request):
-    handle = registry.resolve(request["repo"])
-    return {"text": handle.status_text()}
-
-
 def _op_map_symbols(registry, request):
     handle = registry.resolve(request["repo"])
     rows, next_cursor = handle.map_symbols(
@@ -205,10 +244,17 @@ def _op_map_symbols(registry, request):
 
 def _op_refresh(registry, request):
     handle = registry.resolve(request["repo"])
-    job = registry.submit_refresh(
-        handle, rebuild=request.get("rebuild", False), paths=request.get("paths")
+    job, submission = registry.submit_refresh(
+        handle,
+        rebuild=request.get("rebuild", False),
+        paths=request.get("paths"),
+        include_submission=True,
     )
-    return job.snapshot()
+    return {"job": job.snapshot(), "submission": submission}
+
+
+def _op_metadata(registry, request):
+    return registry.resolve(request["repo"]).index_metadata()
 
 
 def _op_get_job(registry, request):
@@ -229,8 +275,8 @@ _OPS = {
     "resolve": _op_resolve,
     "search": _op_search,
     "status": _op_status,
-    "status_text": _op_status_text,
     "map_symbols": _op_map_symbols,
+    "metadata": _op_metadata,
     "refresh": _op_refresh,
     "get_job": _op_get_job,
     "cancel_job": _op_cancel_job,
@@ -241,10 +287,26 @@ _OPS = {
 # --- client side -------------------------------------------------------------
 
 
-class DaemonClient:
-    """Line-protocol client of one coordinator connection."""
+class _BrokenDaemonTransport(PriorartError):  # noqa: N818 - a transport signal, not a domain error name
+    """The connection broke locally; the daemon-side outcome is unknown.
 
-    def __init__(self, socket_path: Path) -> None:
+    Only local write/read/EOF/framing and response-id failures raise this
+    signal. Daemon-side refusals (protocol, app version, service profile)
+    stay plain ``PriorartError`` and are never replayed automatically.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(DAEMON_MISMATCH, message)
+
+
+class DaemonClient:
+    """Line-protocol client of one coordinator connection.
+
+    One client holds one in-flight request at a time (its mutex serializes
+    write/flush/read); concurrent callers use one client each.
+    """
+
+    def __init__(self, socket_path: Path, profile: str) -> None:
         self.socket_path = Path(socket_path).expanduser()
         self._conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._conn.settimeout(120.0)
@@ -252,6 +314,7 @@ class DaemonClient:
         self._reader = self._conn.makefile("r")
         self._writer = self._conn.makefile("w")
         self._next_id = 0
+        self._profile = profile
         self._mutex = threading.Lock()
         try:
             self._handshake()
@@ -260,7 +323,12 @@ class DaemonClient:
             raise
 
     def _handshake(self) -> None:
-        response = self.call("handshake", protocol=PROTOCOL_VERSION, app_version=APP_VERSION)
+        response = self.call(
+            "handshake",
+            protocol=PROTOCOL_VERSION,
+            app_version=APP_VERSION,
+            profile=self._profile,
+        )
         if response.get("app_version") != APP_VERSION:
             raise PriorartError(DAEMON_MISMATCH, "daemon reported a different application version")
 
@@ -278,15 +346,15 @@ class DaemonClient:
                 response = json.loads(line) if line else None
             except (OSError, ValueError) as err:
                 # a daemon death mid-request (OSError) or a locally closed
-                # connection (ValueError on the file objects) must surface
-                # as a structured domain error, not a raw traceback
-                raise PriorartError(
-                    DAEMON_MISMATCH, f"the priorart daemon connection broke: {err}"
+                # connection (ValueError on the file objects) is a broken
+                # transport link, not a domain refusal
+                raise _BrokenDaemonTransport(
+                    f"the priorart daemon connection broke: {err}"
                 ) from err
         if response is None:
-            raise PriorartError(DAEMON_MISMATCH, "the priorart daemon closed the connection")
+            raise _BrokenDaemonTransport("the priorart daemon closed the connection")
         if response.get("id") != request["id"]:
-            raise PriorartError(DAEMON_MISMATCH, "daemon response id does not match the request")
+            raise _BrokenDaemonTransport("daemon response id does not match the request")
         if response.get("ok"):
             return response.get("data", {})
         error = response.get("error", {})
@@ -310,16 +378,19 @@ class DaemonClient:
             self._conn.close()
 
 
-def connect(config, *, autostart: bool = True) -> DaemonClient:
+def connect(config, *, autostart: bool = True, config_path: Path | None = None) -> DaemonClient:
     """Connect to the configured daemon, starting one when allowed."""
     path = Path(config.daemon_socket or DEFAULT_SOCKET).expanduser()
     try:
-        return DaemonClient(path)
+        return DaemonClient(path, profile_fingerprint(config))
     except (FileNotFoundError, ConnectionRefusedError):
         if not autostart:
             raise
+    argv = [sys.executable, "-m", "priorart", "daemon", "--socket", str(path)]
+    if config_path is not None:
+        argv.extend(("--config", str(Path(config_path).expanduser().resolve())))
     subprocess.Popen(  # noqa: S603 - fixed priorart argv
-        [sys.executable, "-m", "priorart", "daemon", "--socket", str(path)],
+        argv,
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -327,7 +398,7 @@ def connect(config, *, autostart: bool = True) -> DaemonClient:
     deadline = time.monotonic() + _HANDSHAKE_TIMEOUT
     while True:
         try:
-            return DaemonClient(path)
+            return DaemonClient(path, profile_fingerprint(config))
         except (FileNotFoundError, ConnectionRefusedError):
             if time.monotonic() > deadline:
                 raise
@@ -357,9 +428,6 @@ class RemoteHandle:
     def status(self) -> IndexSummary:
         return IndexSummary.from_payload(self._registry.call_op("status", repo=str(self.root)))
 
-    def status_text(self) -> str:
-        return self._registry.call_op("status_text", repo=str(self.root))["text"]
-
     def map_symbols(self, path_glob: str, limit: int = 100, offset: int = 0):
         payload = self._registry.call_op(
             "map_symbols", repo=str(self.root), path_glob=path_glob, limit=limit, cursor=offset
@@ -367,34 +435,69 @@ class RemoteHandle:
         return payload["rows"], payload["next_cursor"]
 
     def index_metadata(self) -> dict:
-        return self.status().payload()
+        return self._registry.call_op("metadata", repo=str(self.root))
 
 
 class RemoteRegistry:
     """Duck-typed registry surface backed by the daemon process.
 
-    Holds a client factory, not one connection: a restarted daemon must not
-    brick an MCP server that resolved handles before the restart. The first
-    call on a dead connection transparently reconnects once.
+    Every admitted operation owns its connection: one client, one handshake,
+    one call, one close — operations never serialize behind a shared socket.
+    A broken link replays only operations whose repeat is provably safe;
+    ``close()`` drains live calls instead of cutting sockets under them.
     """
 
     def __init__(self, client_factory, *, default_repo: str | None = None) -> None:
         self._client_factory = client_factory
-        self._client = client_factory()
         self._default_repo = default_repo
-        self._reconnect_mutex = threading.Lock()
+        self._active = 0
+        self._drained = threading.Condition()
+        self._closed = False
 
     def call_op(self, op: str, **args) -> dict:
-        """One op over the daemon wire, reconnecting once on a broken link."""
+        """One op over the daemon wire, replaying only when provably safe."""
+        with self._drained:
+            if self._closed:
+                raise PriorartError(HANDLE_CLOSED, "this priorart registry is closed")
+            self._active += 1
+        client = None
         try:
-            return self._client.call(op, **args)
-        except PriorartError as err:
-            if err.code != DAEMON_MISMATCH:
-                raise
-        with self._reconnect_mutex:
-            old, self._client = self._client, self._client_factory()
-            old.close()
-            return self._client.call(op, **args)
+            try:
+                client = self._connect()
+            except _BrokenDaemonTransport:
+                # the handshake died before anything was sent: one replay
+                # is safe for every operation
+                client = self._connect()
+            try:
+                return client.call(op, **args)
+            except _BrokenDaemonTransport:
+                if op not in _REPLAY_SAFE_OPS:
+                    raise _uncertain_outcome(op) from None
+                client.close()
+                client = self._connect()
+                return client.call(op, **args)
+        except _BrokenDaemonTransport as err:
+            # retries are exhausted: surface the plain public contract, never
+            # the private transport signal type
+            raise PriorartError(err.code, err.message) from err
+        finally:
+            if client is not None:
+                client.close()
+            with self._drained:
+                self._active -= 1
+                if self._closed and self._active == 0:
+                    self._drained.notify_all()
+
+    def _connect(self):
+        """Open one client; an unreachable daemon is a structured failure."""
+        try:
+            return self._client_factory()
+        except OSError as err:
+            # connect() already spent its autostart deadline retrying; a
+            # raw OSError must not cross the registry surface as a traceback
+            raise PriorartError(
+                DAEMON_MISMATCH, f"could not reach the priorart daemon: {err}"
+            ) from err
 
     def resolve(self, repo: Path | str | None = None) -> RemoteHandle:
         # a startup default (priorart serve <repo>) stays effective in
@@ -403,10 +506,17 @@ class RemoteRegistry:
         payload = self.call_op("resolve", repo=str(effective) if effective is not None else None)
         return RemoteHandle(self, payload["root"])
 
-    def submit_refresh(self, handle, *, rebuild: bool = False, paths=None) -> Job:
-        return Job.from_snapshot(
-            self.call_op("refresh", repo=str(handle.root), rebuild=rebuild, paths=paths)
-        )
+    def submit_refresh(
+        self,
+        handle,
+        *,
+        rebuild: bool = False,
+        paths=None,
+        include_submission: bool = False,
+    ) -> Job | tuple[Job, str]:
+        payload = self.call_op("refresh", repo=str(handle.root), rebuild=rebuild, paths=paths)
+        job = Job.from_snapshot(payload["job"])
+        return (job, payload["submission"]) if include_submission else job
 
     def get_job(self, job_id: str, repo: Path | str | None = None) -> tuple[RemoteHandle, Job]:
         payload = self.call_op(
@@ -420,19 +530,59 @@ class RemoteRegistry:
         )
 
     def workspaces(self) -> dict:
-        return self.call_op("workspaces")
+        workspaces = self.call_op("workspaces")
+        if self._default_repo is not None:
+            configured = workspaces.setdefault("configured", [])
+            if self._default_repo not in configured:
+                configured.append(self._default_repo)
+        return workspaces
 
     def close(self) -> None:
-        self._client.close()
+        """Drain: reject new operations, wait for live ones, stay idempotent.
+
+        Live calls close their own connections when they finish; this method
+        never closes a socket under a running operation.
+        """
+        with self._drained:
+            self._closed = True
+            while self._active:
+                self._drained.wait(timeout=0.1)
 
 
-def remote_registry(config, *, default_repo: Path | str | None = None) -> RemoteRegistry:
-    """Registry talking to the configured daemon socket."""
-    if not config.daemon_socket:
-        raise PriorartError(
-            DAEMON_MISMATCH, "no daemon socket configured; set PRIORART_DAEMON_SOCKET"
+def _uncertain_outcome(op: str) -> PriorartError:
+    """Structured error for a non-replayable op with an unknown outcome."""
+    if op == "refresh":
+        return PriorartError(
+            DAEMON_MISMATCH,
+            "the refresh outcome is unknown: the daemon connection broke in flight",
+            next_action=(
+                "The first refresh may have started. Call refresh_index again to join "
+                "the active job or start a new one if it already finished; call "
+                "get_index_job if you kept the job id."
+            ),
         )
+    return PriorartError(
+        DAEMON_MISMATCH,
+        f"the outcome of daemon op {op!r} is unknown: the connection broke in flight",
+        next_action=(
+            "The first attempt may have acted; inspect the affected state "
+            "before sending the operation again."
+        ),
+    )
+
+
+def remote_registry(
+    config, *, default_repo: Path | str | None = None, config_path: Path | None = None
+) -> RemoteRegistry:
+    """Registry talking to the configured or default daemon socket."""
     return RemoteRegistry(
-        lambda: connect(config),
+        lambda: connect(config, config_path=config_path),
         default_repo=str(default_repo) if default_repo is not None else None,
     )
+
+
+def profile_fingerprint(config) -> str:
+    """Secret-safe identity of behavior-affecting effective configuration."""
+    payload = config.model_dump(mode="json", exclude={"daemon_socket"})
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()

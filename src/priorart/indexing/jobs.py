@@ -20,6 +20,9 @@ from pathlib import Path
 
 from priorart.core import (
     ACTIVE_STATES,
+    FAILURE_JOB_INTERRUPTED,
+    FAILURE_REFRESH_FAILED,
+    FAILURE_WRITER_BUSY,
     JOB_CANCELLED,
     JOB_COMPLETED,
     JOB_DEGRADED,
@@ -62,6 +65,7 @@ class JobManager:
         self._lock = FileLock(lock_path)
         # reentrant: submit() persists while already holding the mutex
         self._mutex = threading.RLock()
+        self._publication_lock = threading.Lock()
         self._wake = threading.Condition(self._mutex)
         self._queue: deque[Job] = deque()
         self._jobs: dict[str, Job] = {}
@@ -69,9 +73,16 @@ class JobManager:
         self._thread = threading.Thread(target=self._worker, daemon=True, name="priorart-index")
         self._thread.start()
 
-    def submit(self, *, rebuild: bool = False, paths: list[str] | None = None) -> Job:
-        """Enqueue a refresh and return its job; joins an equivalent active job."""
+    def submit(
+        self,
+        *,
+        rebuild: bool = False,
+        paths: list[str] | None = None,
+        include_submission: bool = False,
+    ) -> Job | tuple[Job, str]:
+        """Enqueue a refresh, returning the shared job and call disposition."""
         mode = MODE_REBUILD if rebuild else "incremental"
+        normalized_paths = sorted(set(paths)) if paths is not None else None
         with self._mutex:
             if self._stop:
                 # a shut-down manager cannot run the job: fail loudly
@@ -80,19 +91,16 @@ class JobManager:
             for job in self._jobs.values():
                 if (
                     job.state in ACTIVE_STATES
-                    and paths is None
-                    # a full refresh must not join a scoped job: the caller
-                    # would follow a job that only processed a subset
-                    and job.paths is None
+                    and job.paths == normalized_paths
                     and not job.cancel_requested
                     and mode_covers(job.mode, mode)
                 ):
-                    return job
+                    return (job, "joined") if include_submission else job
             job = Job(
                 job_id=new_job_id(),
                 repo=str(self.root),
                 mode=mode,
-                paths=paths,
+                paths=normalized_paths,
                 created_at=time.time(),
                 heartbeat_at=time.time(),
             )
@@ -101,7 +109,7 @@ class JobManager:
             self._queue.append(job)
             self._persist(job)
             self._wake.notify_all()
-            return job
+            return (job, "started") if include_submission else job
 
     def get(self, job_id: str) -> Job | None:
         with self._mutex:
@@ -109,18 +117,21 @@ class JobManager:
 
     def cancel(self, job_id: str) -> Job | None:
         """Request cancellation; the worker acts on it between work units."""
-        with self._mutex:
+        with self._publication_lock, self._mutex:
             job = self._jobs.get(job_id)
             if job is not None and job.state in ACTIVE_STATES:
                 job.cancel_requested = True
             return job
 
     def shutdown(self, *, wait: bool = True) -> None:
-        with self._mutex:
+        with self._publication_lock, self._mutex:
             self._stop = True
+            for job in self._jobs.values():
+                if job.state in ACTIVE_STATES:
+                    job.cancel_requested = True
             self._wake.notify_all()
         if wait:
-            self._thread.join(timeout=30)
+            self._thread.join()
         # closing the connections under a live worker would abort its next
         # journal write mid-transaction; only a stopped worker owns them now
         if not self._thread.is_alive():
@@ -143,15 +154,22 @@ class JobManager:
                 # mark the job failed and keep the worker alive
                 with self._mutex:
                     job.state = JOB_FAILED
-                    job.error = f"{type(err).__name__}: {err}"
+                    job.failure = _failure(
+                        FAILURE_REFRESH_FAILED,
+                        f"{type(err).__name__}: {err}",
+                        retryable=True,
+                        next_action="Retry refresh_index; inspect logs if the failure repeats.",
+                    )
                 self._persist(job)
 
     def _run(self, job: Job) -> None:
         if not self._lock.acquire():
             job.state = JOB_FAILED
-            job.error = (
-                "another priorart process holds the writer lock for this repository; "
-                "retry when it finishes"
+            job.failure = _failure(
+                FAILURE_WRITER_BUSY,
+                "another priorart process holds the writer lock for this repository",
+                retryable=True,
+                next_action="Wait for the active refresh to finish, then retry refresh_index.",
             )
             self._persist(job)
             return
@@ -171,12 +189,19 @@ class JobManager:
                     should_cancel=lambda: job.cancel_requested,
                     embed_cache=self._embed_cache,
                     embed_space_id=self._embed_space_id,
+                    publication_guard=self._publication_lock,
+                    publication_record=self._record_publication(job),
                 )
             except RefreshCancelledError:
                 job.state = JOB_CANCELLED
             except Exception as err:  # noqa: BLE001 - job failure must be diagnosable
                 job.state = JOB_FAILED
-                job.error = f"{type(err).__name__}: {err}"
+                job.failure = _failure(
+                    FAILURE_REFRESH_FAILED,
+                    f"{type(err).__name__}: {err}",
+                    retryable=True,
+                    next_action="Retry refresh_index; inspect logs if the failure repeats.",
+                )
             else:
                 job.counters.update(
                     {
@@ -207,11 +232,36 @@ class JobManager:
             job.phase = phase
             job.heartbeat_at = time.time()
             for key, value in counters.items():
-                job.counters[key] = value
-            if events % _HEARTBEAT_EVERY_EVENTS == 1:
+                if key != "epoch":
+                    job.counters[key] = value
+            if phase == "lexical_published":
+                job.epoch = counters["epoch"]
+                job.lexical_ready = True
+                self._persist(job)
+            elif events % _HEARTBEAT_EVERY_EVENTS == 1:
                 self._persist(job)
 
         return progress
+
+    def _record_publication(self, job: Job):
+        """Persist this job's epoch inside the lexical commit transaction."""
+
+        def record(conn, publication: dict) -> None:
+            counters = dict(job.counters)
+            counters.update({key: value for key, value in publication.items() if key != "epoch"})
+            conn.execute(
+                "UPDATE jobs SET phase = ?, heartbeat_at = ?, counters = ?, epoch = ? "
+                "WHERE job_id = ?",
+                (
+                    "lexical_published",
+                    time.time(),
+                    json.dumps(counters),
+                    publication["epoch"],
+                    job.job_id,
+                ),
+            )
+
+        return record
 
     def _reconcile(self, current_job_id: str) -> None:
         """Mark jobs of dead owners as interrupted (we hold the writer lock).
@@ -247,7 +297,7 @@ class JobManager:
                     job.created_at,
                     job.heartbeat_at,
                     json.dumps(job.snapshot()["counters"]),
-                    job.error,
+                    json.dumps(job.failure) if job.failure is not None else None,
                     job.epoch,
                 ),
             )
@@ -280,10 +330,47 @@ def journal_job(conn, job_id: str) -> Job | None:
         epoch=row[9],
     )
     job.counters = json.loads(row[7]) if row[7] else {}
-    job.error = row[8]
+    if row[8]:
+        try:
+            job.failure = json.loads(row[8])
+        except (TypeError, ValueError):
+            job.failure = _failure(
+                FAILURE_REFRESH_FAILED,
+                row[8],
+                retryable=True,
+                next_action="Retry refresh_index; inspect logs if the failure repeats.",
+            )
+    job.lexical_ready = job.epoch > 0
+    job.dense_ready = (
+        job.state in (JOB_COMPLETED, JOB_DEGRADED)
+        and job.counters.get("missing_vectors", 0) == 0
+        and job.counters.get("embed_failures", 0) == 0
+    )
     if job.state in ACTIVE_STATES:
         # the owning service died mid-run: the journal row never got a
         # final state, and the next lock owner would reconcile it exactly
         # like this
         job.state = JOB_INTERRUPTED
+        job.failure = _failure(
+            FAILURE_JOB_INTERRUPTED,
+            "the coordinator stopped before this refresh reached a terminal state",
+            retryable=True,
+            next_action="Call refresh_index again for this repository.",
+        )
+    elif job.state == JOB_INTERRUPTED and job.failure is None:
+        job.failure = _failure(
+            FAILURE_JOB_INTERRUPTED,
+            "the coordinator stopped before this refresh reached a terminal state",
+            retryable=True,
+            next_action="Call refresh_index again for this repository.",
+        )
     return job
+
+
+def _failure(code: str, message: str, *, retryable: bool, next_action: str) -> dict[str, object]:
+    return {
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "next_action": next_action,
+    }

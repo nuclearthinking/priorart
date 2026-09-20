@@ -50,7 +50,7 @@ def index(
     try:
         handle = registry.resolve(_absolute(path))
         job = registry.submit_refresh(handle, rebuild=rebuild)
-        job = _follow_job(registry, job.job_id, json_progress=json_progress)
+        job = _follow_job(registry, job.job_id, repo=handle.root, json_progress=json_progress)
     except PriorartError as err:
         _fail(err)
     except KeyboardInterrupt:
@@ -59,7 +59,7 @@ def index(
         typer.echo("interrupted; requesting job cancellation", err=True)
         with contextlib.suppress(Exception):  # best effort on the way out
             if job is not None:
-                registry.cancel_job(job.job_id)
+                registry.cancel_job(job.job_id, job.repo)
         raise
     finally:
         registry.close()
@@ -75,7 +75,7 @@ def index(
     for warning in job.warnings:
         typer.echo(f"warning: {warning}")
     if job.state == "failed":
-        typer.echo(f"error: {job.error}")
+        typer.echo(f"error: {job.failure['message']}")
         raise typer.Exit(code=1)
 
 
@@ -123,11 +123,15 @@ def serve(
     config: Annotated[
         Path | None, typer.Option("--config", help="Explicit service config file.")
     ] = None,
+    embedded: Annotated[  # noqa: FBT002
+        bool,
+        typer.Option("--embedded", help="Host jobs in this MCP process (development/tests)."),
+    ] = False,
 ) -> None:
     from .server import build_server
 
     settings = Config(_env_file=config) if config is not None else None
-    build_server(_absolute(repo), config=settings).run()
+    build_server(_absolute(repo), config=settings, config_path=config, embedded=embedded).run()
 
 
 @app.command()
@@ -158,6 +162,11 @@ def doctor(
         typer.echo("mcp sdk: not installed")
     typer.echo(f"sqlite: {sqlite3.sqlite_version}")
     typer.echo(f"index_dir: {settings.index_dir}")
+    from .coordinator import DEFAULT_SOCKET, profile_fingerprint
+
+    typer.echo("mcp_mode: daemon (default)")
+    typer.echo(f"daemon_socket: {Path(settings.daemon_socket or DEFAULT_SOCKET).expanduser()}")
+    typer.echo(f"service_profile: {profile_fingerprint(settings)[:12]}")
 
     configured = sorted(settings.model_fields_set)
     if configured:
@@ -189,10 +198,9 @@ def daemon(
 ) -> None:
     """Run the shared coordinator: jobs, watchers and caches in one process.
 
-    Clients (MCP servers with PRIORART_DAEMON_SOCKET configured) become
-    thin front-ends of this process; background indexing survives client
-    restarts. Correctness never depends on the daemon: stores, locks and
-    atomic commits stay valid without it.
+    MCP servers are thin front-ends of this process by default; background
+    indexing survives client restarts. Correctness never depends on the
+    daemon: stores, locks and atomic commits stay valid without it.
     """
     from .coordinator import DEFAULT_SOCKET
     from .coordinator import serve as serve_coordinator
@@ -217,10 +225,10 @@ def _absolute(path: Path | None) -> Path | None:
     return Path(path).expanduser().resolve()
 
 
-def _follow_job(registry: RuntimeRegistry, job_id: str, *, json_progress: bool):
+def _follow_job(registry: RuntimeRegistry, job_id: str, *, repo: Path, json_progress: bool):
     last = None
     while True:
-        _handle, job = registry.get_job(job_id)
+        _handle, job = registry.get_job(job_id, repo)
         current = (job.state, job.phase, tuple(sorted(job.counters.items())))
         if current != last:
             if json_progress:
