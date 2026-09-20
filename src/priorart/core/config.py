@@ -6,22 +6,29 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .search import CANDIDATE_LIMIT
-
 HOME_ENV_FILE = Path.home() / ".priorart" / "priorart.env"
+
+DEFAULT_CANDIDATE_LIMIT = 50
 
 
 class Config(BaseSettings):
-    """Runtime configuration.
+    """Service configuration, loaded once from explicit sources.
 
-    Values come from PRIORART_* environment variables, then a project-local
-    .env, then ~/.priorart/priorart.env; real environment variables win over
-    both files, and the project-local .env wins over the home file.
+    Values come from PRIORART_* environment variables, then
+    ``~/.priorart/priorart.env``, then an explicit ``--config`` file; real
+    environment variables win over both files, and the explicit file wins
+    over the home file. There is deliberately no project-local ``.env``:
+    resolving the service config must not depend on the process working
+    directory or on any indexed repository.
+
+    ``index_dir`` is the root of the per-worktree store tree
+    (``<index_dir>/v<layout>/<worktree-id>/<profile-id>.db``); there is no
+    single shared index database anymore.
     """
 
     model_config = SettingsConfigDict(
         env_prefix="PRIORART_",
-        env_file=(HOME_ENV_FILE, ".env"),
+        env_file=HOME_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
         frozen=True,
@@ -53,6 +60,42 @@ class Config(BaseSettings):
         ),
     )
     rerank_model: str = Field(default="", description="Reranker model id sent to the provider")
+    watch_interval: float = Field(
+        default=2.0,
+        ge=0,
+        description=(
+            "Background freshness polling interval in seconds; 0 disables the auto-refresh watcher"
+        ),
+    )
+    watch_debounce: float = Field(
+        default=0.5,
+        ge=0,
+        description="Quiet period in seconds before detected changes trigger a refresh",
+    )
+    watch_content_interval: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            "Period in seconds for content-hash reconciliation of files whose "
+            "size and mtime did not change"
+        ),
+    )
+    search_deadline_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        description=(
+            "Monotonic end-to-end budget of one search: expansion, embedding "
+            "and reranking are clamped to the remaining time and degrade to "
+            "warnings instead of overrunning"
+        ),
+    )
+    daemon_socket: str | None = Field(
+        default=None,
+        description=(
+            "Unix socket of the shared coordinator daemon; when set, MCP serve "
+            "becomes a thin client of that process instead of hosting its own registry"
+        ),
+    )
     rerank_protocol: Literal["openai", "llama-completion"] = Field(
         default="openai",
         description=(
@@ -76,15 +119,15 @@ class Config(BaseSettings):
         description="Add suitable owner symbols from files the fused ranking found to the rerank pool",
     )
     candidate_limit: int = Field(
-        default=CANDIDATE_LIMIT,
+        default=DEFAULT_CANDIDATE_LIMIT,
         ge=1,
         le=500,
         description="How many fused (FTS + dense, RRF) symbols enter the rerank pool",
     )
-    db_path: Path = Field(
-        default=Path.home() / ".priorart" / "index.db",
-        validation_alias="PRIORART_DB",
-        description="SQLite index location",
+    index_dir: Path = Field(
+        default=Path.home() / ".priorart" / "indexes",
+        validation_alias="PRIORART_INDEX_DIR",
+        description="Root of the per-worktree SQLite store tree",
     )
 
     @field_validator(
@@ -107,7 +150,7 @@ class Config(BaseSettings):
     def _blank_means_default(cls, value):
         return True if value == "" else value
 
-    @field_validator("db_path", mode="before")
+    @field_validator("index_dir", mode="before")
     @classmethod
     def _expand_user(cls, value):
         return Path(value).expanduser() if isinstance(value, (str, Path)) else value

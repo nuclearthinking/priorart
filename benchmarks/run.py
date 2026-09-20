@@ -15,20 +15,20 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path, PurePosixPath
 
-from priorart.config import Config
-from priorart.expand import EXPAND_PROMPT
-from priorart.indexer import (
+from priorart.core.config import Config
+from priorart.indexing.capture import capture_file
+from priorart.indexing.inventory import repo_languages
+from priorart.indexing.parser import (
     EMBED_TEXT_FORMAT,
     LANGS,
     SEARCH_TEXT_FORMAT,
-    capture_file,
     parse_source,
     preflight_parsers,
-    repo_languages,
 )
-from priorart.rerank import make_reranker
-from priorart.runtime import Runtime
-from priorart.search import (
+from priorart.models.expand import EXPAND_PROMPT
+from priorart.models.rerank import make_reranker
+from priorart.registry import RepoHandle, RuntimeRegistry
+from priorart.retrieval.search import (
     BODY_MAX_CHARS,
     EXPANSION_FILE_QUOTA,
     EXPANSION_LIMIT,
@@ -40,6 +40,53 @@ from priorart.search import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _Runner:
+    """Synchronous benchmark wrapper over the registry/handle API."""
+
+    def __init__(self, repo: Path):
+        self.registry = RuntimeRegistry(Config())
+        self.handle: RepoHandle = self.registry.resolve(Path(repo).resolve())
+        self.conn = None
+
+    @property
+    def repo(self) -> Path:
+        return self.handle.root
+
+    @property
+    def config(self) -> Config:
+        return self.handle.config
+
+    def reindex(self, *, rebuild: bool = False) -> dict:
+        from priorart.core.jobs import FINAL_STATES
+
+        job = self.registry.submit_refresh(self.handle, rebuild=rebuild)
+        while job.state not in FINAL_STATES:
+            time.sleep(0.05)
+            job = self.registry.get_job(job.job_id)[1]
+        if job.state not in {"completed", "degraded"}:
+            raise SystemExit(f"indexing job {job.state}: {job.error}")
+        if self.conn is not None:
+            self.conn.close()
+        self.conn = self.handle.reader()
+        return {
+            "files": job.counters.get("files", 0),
+            "symbols": job.counters.get("symbols", 0),
+            "removed": job.counters.get("removed", 0),
+            "warnings": list(job.warnings),
+            "index_epoch": job.epoch,
+            "job_state": job.state,
+        }
+
+    def search(self, query: str, k: int):
+        return self.handle.search(query, k=k)
+
+    def symbol_count(self) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE repo = ?", (str(self.repo),)
+        ).fetchone()[0]
+
 
 LEGACY_DOCUMENT_FORMAT = "signature-docstring-v1"
 LEGACY_LOCATOR_FORMAT = "path-qualname-kind-signature-docstring-v1"
@@ -63,13 +110,14 @@ def _document_current_format(candidate: dict, max_chars: int) -> str:
             name="",
             qualname=candidate["qualname"],
             kind=candidate["kind"],
-            lang="",
+            lang=candidate.get("lang", "python"),
             line=candidate.get("line", 0),
-            end_line=0,
+            end_line=candidate.get("end_line", 0),
             signature=candidate.get("signature", ""),
-            full_signature=candidate["full_signature"],
+            full_signature=candidate.get("full_signature", ""),
             docstring=candidate.get("docstring", ""),
             body=candidate.get("body", ""),
+            source_role=candidate.get("source_role", "production"),
             score=candidate.get("score", 0.0),
         ),
         body_max_chars=max_chars,
@@ -293,20 +341,20 @@ def _run_benchmark(args) -> dict:
         raise SystemExit(f"parser preflight failed: {details}")
 
     config = Config()
-    if "PRIORART_DB" not in os.environ and "db_path" not in config.model_fields_set:
-        # The index DB is only valid for one embedding profile: model,
+    if "PRIORART_INDEX_DIR" not in os.environ and "index_dir" not in config.model_fields_set:
+        # The index store is only valid for one embedding profile: model,
         # dimension and input format together define the vector space, so all
         # three belong in the key. Otherwise an A/B over embed_input_format
         # would reuse vectors embedded with the other contract.
         model_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", config.embed_model or "lexical")
         format_key = config.embed_input_format or "default"
-        os.environ["PRIORART_DB"] = str(
-            ROOT / ".bench" / f"index-{model_key}-{config.embed_dim}-{format_key}.db"
+        os.environ["PRIORART_INDEX_DIR"] = str(
+            ROOT / ".bench" / f"indexes-{model_key}-{config.embed_dim}-{format_key}"
         )
     if args.no_pool_expansion:
         os.environ["PRIORART_POOL_EXPANSION"] = "false"
 
-    runtime = Runtime(repo)
+    runtime = _Runner(repo)
     index_started = time.perf_counter()
     index_stats = runtime.reindex(rebuild=args.rebuild)
     index_seconds = time.perf_counter() - index_started
@@ -561,7 +609,7 @@ def _replay_loss_stage(rank: int | None, k: int) -> str | None:
     return None
 
 
-def _coverage(runtime: Runtime) -> dict:
+def _coverage(runtime: _Runner) -> dict:
     repo = str(runtime.repo)
     return {
         "parse": dict(
@@ -668,7 +716,7 @@ def _verify_snapshot(repo: Path, revision: str) -> None:
         raise SystemExit("snapshot has uncommitted changes")
 
 
-def _verify_expected_symbols(runtime: Runtime, cases: list[dict]) -> dict[str, int]:
+def _verify_expected_symbols(runtime: _Runner, cases: list[dict]) -> dict[str, int]:
     counts = Counter(case["id"] for case in cases)
     duplicates = sorted(case_id for case_id, count in counts.items() if count > 1)
     if duplicates:

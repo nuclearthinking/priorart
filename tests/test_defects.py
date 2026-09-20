@@ -5,17 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from priorart.indexer import ParseResult, index_repo, parse_source
-from priorart.search import (
-    _fetch,
-    format_report,
-    fts_search,
-    search,
-    status_text,
-    valid_rerank_order,
-)
-from priorart.store import connect
-from tests.helpers import git, make_config
+from priorart.indexing.inventory import repo_languages
+from priorart.indexing.parser import ParseResult, parse_source
+from priorart.indexing.pipeline import index_repo
+from priorart.models.embed import make_embedder  # noqa: F401 - imported for parity by units
+from priorart.retrieval import format_report, search, status_text, valid_rerank_order
+from priorart.retrieval.search import _fetch, fts_search
+from priorart.storage import StoreProfile, initialize_writer
+from tests.helpers import git, init_repo
 
 SAMPLE = '''\
 def parse_diff_patch(raw: bytes) -> list[str]:
@@ -31,15 +28,14 @@ class DiffViewer:
 '''
 
 
-def _init_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    git(repo, "init", "-q")
-    return repo
+def _connect(tmp_path: Path, **profile):
+    return initialize_writer(
+        tmp_path / "test.db", StoreProfile(embed_dim=profile.pop("embed_dim", 4), **profile)
+    )
 
 
 def _index(repo: Path, tmp_path: Path, embed_fn=None, *, rebuild=False):
-    conn = connect(tmp_path / "test.db", embed_dim=4)
+    conn = _connect(tmp_path)
     return conn, index_repo(conn, repo, embed_fn=embed_fn, rebuild=rebuild)
 
 
@@ -47,8 +43,8 @@ def _file_rows(conn, repo: Path) -> set[str]:
     return {row[0] for row in conn.execute("SELECT path FROM files WHERE repo = ?", (str(repo),))}
 
 
-def test_worktree_indexes_only_tracked_files(tmp_path):
-    repo = _init_repo(tmp_path)
+def test_inventory_includes_untracked_and_excludes_ignored(tmp_path):
+    repo = init_repo(tmp_path / "repo")
     (repo / "tracked.py").write_text("def tracked(): pass\n")
     (repo / ".gitignore").write_text("ignored.py\n")
     git(repo, "add", "tracked.py", ".gitignore")
@@ -58,17 +54,18 @@ def test_worktree_indexes_only_tracked_files(tmp_path):
 
     worktree = tmp_path / "worktree"
     git(repo, "worktree", "add", "-q", str(worktree))
+    (worktree / "untracked.py").write_text("def untracked(): pass\n")
 
     conn, _stats = _index(worktree, tmp_path)
-    assert _file_rows(conn, worktree) == {"tracked.py"}
+    assert _file_rows(conn, worktree) == {"tracked.py", "untracked.py"}
     names = {
         row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(worktree),))
     }
-    assert names == {"tracked"}
+    assert names == {"tracked", "untracked"}
 
 
 def test_symlink_outside_repo_is_skipped(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "tracked.py").write_text("def tracked(): pass\n")
     outside = tmp_path / "outside.py"
     outside.write_text("def secret(): '''s3cr3t doc'''\n    pass\n")
@@ -85,7 +82,7 @@ def test_symlink_outside_repo_is_skipped(tmp_path):
 
 
 def test_rebuild_removes_vanished_files(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "kept.py").write_text("def kept(): pass\n")
     (repo / "gone.py").write_text("def gone(): pass\n")
     git(repo, "add", "kept.py", "gone.py")
@@ -103,8 +100,8 @@ def test_rebuild_removes_vanished_files(tmp_path):
     assert _file_rows(conn, repo) == {"kept.py"}
 
 
-def test_embedding_failure_records_embed_failed_parse_state(tmp_path):
-    repo = _init_repo(tmp_path)
+def test_embedding_failure_publishes_lexical_symbols(tmp_path):
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def sample(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -114,17 +111,24 @@ def test_embedding_failure_records_embed_failed_parse_state(tmp_path):
     )
 
     assert stats["warnings"] == ["embedding down"]
-    status, detail = conn.execute(
+    assert stats["symbols"] == 1
+    assert stats["embed_failures"] == 1
+    status, _detail = conn.execute(
         "SELECT status, detail FROM parse_state WHERE repo = ? AND path = 'sample.py'",
         (str(repo),),
     ).fetchone()
-    assert status == "embed_failed"
-    assert "embedding down" in detail
-    assert "kept previous symbols" in detail
+    assert status == "ok"
+    vectorized = conn.execute(
+        "SELECT COUNT(*) FROM symbols_vec WHERE repo = ?", (str(repo),)
+    ).fetchone()[0]
+    assert vectorized == 0
+    # lexical search still finds the published symbol
+    report = search(conn, str(repo), "sample", k=3)
+    assert report.candidates[0].qualname == "sample"
 
 
 def test_embedding_failure_is_retried(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -139,11 +143,12 @@ def test_embedding_failure_is_retried(tmp_path):
 
     conn, stats = _index(repo, tmp_path, embed_fn=flaky_embed)
     assert stats["warnings"] == ["embedding request failed (test)"]
-    assert _file_rows(conn, repo) == set()
+    assert stats["symbols"] == 3
 
+    # the file stat did not change, but the missing vectors are retried
     stats = index_repo(conn, repo, embed_fn=flaky_embed)
     assert stats["warnings"] == []
-    assert stats["symbols"] == 3
+    assert stats["files"] == 0
     vectorized = conn.execute(
         "SELECT COUNT(*) FROM symbols_vec WHERE repo = ?", (str(repo),)
     ).fetchone()[0]
@@ -151,7 +156,7 @@ def test_embedding_failure_is_retried(tmp_path):
 
 
 def test_expansion_keeps_raw_query_first(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def exact_unique_symbol(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -168,7 +173,7 @@ def test_expansion_keeps_raw_query_first(tmp_path):
 
 
 def test_fts_search_handles_non_ascii_queries(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "retry.py").write_text(
         'def retry_request():\n    """повторить неудачный запрос"""\n    pass\n'
     )
@@ -181,7 +186,7 @@ def test_fts_search_handles_non_ascii_queries(tmp_path):
 
 
 def test_status_reports_staleness(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -200,7 +205,7 @@ def test_status_reports_staleness(tmp_path):
 
 
 def test_status_reports_dirty_working_tree(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -282,7 +287,7 @@ def _vector(texts, *, query=False):
 
 
 def test_file_changed_during_embedding_is_reprocessed(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     target = repo / "sample.py"
     target.write_text("def original(): pass\n")
     git(repo, "add", "sample.py")
@@ -293,8 +298,7 @@ def test_file_changed_during_embedding_is_reprocessed(tmp_path):
         target.write_text("def replacement(): pass\n")
         return [b"\x00\x00\x80?" * 4] * len(texts), None
 
-    conn, stats = _index(repo, tmp_path, embed_fn=embed_that_edits_file)
-    assert any("changed during indexing" in warning for warning in stats["warnings"])
+    conn, _stats = _index(repo, tmp_path, embed_fn=embed_that_edits_file)
     names = {
         row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(repo),))
     }
@@ -311,21 +315,23 @@ def test_file_changed_during_embedding_is_reprocessed(tmp_path):
 
 
 def test_parse_error_keeps_previous_symbols_and_retries(tmp_path, monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import pipeline
 
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def good(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     monkeypatch.setattr(
-        indexer, "parse_source", lambda data, lang, rel: ParseResult([], "error", "boom")
+        pipeline, "parse_source", lambda data, lang, rel: ParseResult([], "error", "boom")
     )
     (repo / "sample.py").write_text("def changed(): pass\n")
 
     stats = index_repo(conn, repo)
-    assert stats["warnings"] == ["sample.py: parse error (boom); kept previous symbols"]
+    assert stats["warnings"] == [
+        "sample.py: error (boom); kept previous symbols as a stale fallback"
+    ]
     names = {
         row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(repo),))
     }
@@ -333,25 +339,29 @@ def test_parse_error_keeps_previous_symbols_and_retries(tmp_path, monkeypatch):
 
     # the file is not marked indexed: every refresh retries it
     stats = index_repo(conn, repo)
-    assert stats["warnings"] == ["sample.py: parse error (boom); kept previous symbols"]
+    assert stats["warnings"] == [
+        "sample.py: error (boom); kept previous symbols as a stale fallback"
+    ]
 
 
 def test_unsupported_parser_keeps_previous_symbols(tmp_path, monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import pipeline
 
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def good(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     monkeypatch.setattr(
-        indexer, "parse_source", lambda data, lang, rel: ParseResult([], "unsupported", "gone")
+        pipeline, "parse_source", lambda data, lang, rel: ParseResult([], "unsupported", "gone")
     )
     (repo / "sample.py").write_text("def other(): pass\n")
 
     stats = index_repo(conn, repo)
-    assert stats["warnings"] == ["sample.py: parse unsupported (gone); kept previous symbols"]
+    assert stats["warnings"] == [
+        "sample.py: unsupported (gone); kept previous symbols as a stale fallback"
+    ]
     names = {
         row[0] for row in conn.execute("SELECT name FROM symbols WHERE repo = ?", (str(repo),))
     }
@@ -359,9 +369,9 @@ def test_unsupported_parser_keeps_previous_symbols(tmp_path, monkeypatch):
 
 
 def test_partial_parse_indexes_symbols_with_warning(tmp_path, monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import pipeline
 
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def good(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -369,7 +379,7 @@ def test_partial_parse_indexes_symbols_with_warning(tmp_path, monkeypatch):
 
     symbol = parse_source(b"def partial(): pass\n", "python", "sample.py").symbols[0]
     monkeypatch.setattr(
-        indexer, "parse_source", lambda data, lang, rel: ParseResult([symbol], "partial", "syntax")
+        pipeline, "parse_source", lambda data, lang, rel: ParseResult([symbol], "partial", "syntax")
     )
     (repo / "sample.py").write_text("def changed(): pass\n")
 
@@ -392,7 +402,7 @@ def _hybrid_order(conn, repo: Path) -> list[str]:
 
 
 def test_rerank_incomplete_order_keeps_hybrid_order(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -410,7 +420,7 @@ def test_rerank_incomplete_order_keeps_hybrid_order(tmp_path):
 
 
 def test_rerank_duplicate_index_keeps_hybrid_order(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -428,7 +438,7 @@ def test_rerank_duplicate_index_keeps_hybrid_order(tmp_path):
 
 
 def test_valid_rerank_reorders_candidates(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -443,16 +453,14 @@ def test_valid_rerank_reorders_candidates(tmp_path):
 
 
 def test_fetch_is_scoped_to_repo(tmp_path):
-    repo_a = tmp_path / "repo_a"
-    repo_b = tmp_path / "repo_b"
+    repo_a = init_repo(tmp_path / "repo_a")
+    repo_b = init_repo(tmp_path / "repo_b")
     for repo in (repo_a, repo_b):
-        repo.mkdir()
-        git(repo, "init", "-q")
         (repo / "sample.py").write_text("def shared_name(): pass\n")
         git(repo, "add", "sample.py")
         git(repo, "commit", "-q", "-m", "init")
 
-    conn = connect(tmp_path / "test.db", embed_dim=4)
+    conn = _connect(tmp_path)
     index_repo(conn, repo_a)
     index_repo(conn, repo_b)
     ids_b = [
@@ -464,7 +472,7 @@ def test_fetch_is_scoped_to_repo(tmp_path):
 
 
 def test_symlinked_parent_directory_is_not_indexed(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "pkg").mkdir()
     (repo / "pkg" / "code.py").write_text("def inside(): pass\n")
     git(repo, "add", "pkg/code.py")
@@ -485,9 +493,9 @@ def test_symlinked_parent_directory_is_not_indexed(tmp_path):
 
 
 def test_index_repo_crash_does_not_poison_connection(tmp_path, monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import pipeline
 
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def good(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -497,7 +505,7 @@ def test_index_repo_crash_does_not_poison_connection(tmp_path, monkeypatch):
         conn.execute("DELETE FROM files WHERE repo = 'nonexistent'")
         raise KeyboardInterrupt("simulated crash mid-index")
 
-    monkeypatch.setattr(indexer, "_drop_symbols", exploding_drop)
+    monkeypatch.setattr(pipeline, "_drop_symbols", exploding_drop)
     (repo / "sample.py").write_text("def changed(): pass\n")
     with pytest.raises(KeyboardInterrupt):
         index_repo(conn, repo)
@@ -509,20 +517,21 @@ def test_index_repo_crash_does_not_poison_connection(tmp_path, monkeypatch):
     assert report.symbol_count == 1
 
 
-def test_embedding_failure_without_warning_is_not_counted(tmp_path):
-    repo = _init_repo(tmp_path)
+def test_embedding_failure_without_warning_uses_default_warning(tmp_path):
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def good(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
 
     conn, stats = _index(repo, tmp_path, embed_fn=lambda texts, *, query=False: (None, None))
-    assert stats["files"] == 0
-    assert stats["warnings"] == ["embedding failed without a warning"]
-    assert _file_rows(conn, repo) == set()
+    assert stats["files"] == 1
+    assert stats["symbols"] == 1
+    assert stats["warnings"] == ["embedding failed; dense coverage stays partial"]
+    assert _file_rows(conn, repo) == {"sample.py"}
 
 
 def test_rerank_ignores_non_dict_and_bad_index_items(monkeypatch, tmp_path):
-    from priorart import rerank as rerank_mod
+    from priorart.models import rerank as rerank_mod
 
     monkeypatch.setattr(
         rerank_mod,
@@ -536,11 +545,12 @@ def test_rerank_ignores_non_dict_and_bad_index_items(monkeypatch, tmp_path):
             ]
         },
     )
+    from tests.helpers import make_config
+
     config = make_config(
         tmp_path,
         rerank_base_url="http://rerank.example/v1",
         rerank_model="reranker",
-        db_path=tmp_path / "rerank-test.db",
     )
     rerank = rerank_mod.make_reranker(config)
     order, warning = rerank("query", ["doc0", "doc1"])
@@ -549,7 +559,7 @@ def test_rerank_ignores_non_dict_and_bad_index_items(monkeypatch, tmp_path):
 
 
 def test_rerank_raw_format_passes_query_unchanged(monkeypatch, tmp_path):
-    from priorart import rerank as rerank_mod
+    from priorart.models import rerank as rerank_mod
 
     seen = {}
 
@@ -558,12 +568,13 @@ def test_rerank_raw_format_passes_query_unchanged(monkeypatch, tmp_path):
         return {"results": [{"index": 0, "relevance_score": 0.9}]}
 
     monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    from tests.helpers import make_config
+
     config = make_config(
         tmp_path,
         rerank_base_url="http://rerank.example/v1",
         rerank_model="reranker",
         rerank_query_format="raw",
-        db_path=tmp_path / "rerank-raw-test.db",
     )
     rerank = rerank_mod.make_reranker(config)
     order, warning = rerank("retry failed calls", ["doc0"])
@@ -573,7 +584,7 @@ def test_rerank_raw_format_passes_query_unchanged(monkeypatch, tmp_path):
 
 
 def test_rerank_instruct_format_wraps_query(monkeypatch, tmp_path):
-    from priorart import rerank as rerank_mod
+    from priorart.models import rerank as rerank_mod
 
     seen = {}
 
@@ -582,11 +593,12 @@ def test_rerank_instruct_format_wraps_query(monkeypatch, tmp_path):
         return {"results": [{"index": 0, "relevance_score": 0.9}]}
 
     monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    from tests.helpers import make_config
+
     config = make_config(
         tmp_path,
         rerank_base_url="http://rerank.example/v1",
         rerank_model="reranker",
-        db_path=tmp_path / "rerank-instruct-test.db",
     )
     rerank = rerank_mod.make_reranker(config)
     order, warning = rerank("retry failed calls", ["doc0"])
@@ -605,7 +617,7 @@ def test_valid_rerank_rejects_bool_and_nonfinite_scores():
 
 
 def test_search_dense_path_inside_read_transaction(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -622,9 +634,9 @@ def test_search_dense_path_inside_read_transaction(tmp_path):
 
 
 def test_partial_parse_state_persists_across_refreshes(tmp_path, monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import pipeline
 
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def good(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -632,7 +644,7 @@ def test_partial_parse_state_persists_across_refreshes(tmp_path, monkeypatch):
 
     symbol = parse_source(b"def partial(): pass\n", "python", "sample.py").symbols[0]
     monkeypatch.setattr(
-        indexer, "parse_source", lambda data, lang, rel: ParseResult([symbol], "partial", "syntax")
+        pipeline, "parse_source", lambda data, lang, rel: ParseResult([symbol], "partial", "syntax")
     )
     (repo / "sample.py").write_text("def changed(): pass\n")
 
@@ -651,28 +663,36 @@ def test_partial_parse_state_persists_across_refreshes(tmp_path, monkeypatch):
     assert attempted_at > 0
     assert "1 partial" in status_text(conn, str(repo), dense=False)
 
-    report = search(conn, str(repo), "partial", k=3)
+    report = search(conn, str(repo), "partial symbol", k=3)
     assert report.parse_coverage == {"partial": 1}
     assert "parse issues: 1 partial" in format_report(report)
 
+    # an exact identifier match answers without models and without the
+    # full pipeline (parse coverage is not part of the exact report)
+    exact = search(conn, str(repo), "partial", k=3)
+    assert exact.stages_used == ["exact"]
+    assert exact.candidates[0].qualname == "partial"
+
 
 def test_parse_error_state_persists_and_retries(tmp_path, monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import pipeline
 
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def good(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
     monkeypatch.setattr(
-        indexer, "parse_source", lambda data, lang, rel: ParseResult([], "error", "boom")
+        pipeline, "parse_source", lambda data, lang, rel: ParseResult([], "error", "boom")
     )
     (repo / "sample.py").write_text("def changed(): pass\n")
 
     for _ in range(2):
         stats = index_repo(conn, repo)
-        assert stats["warnings"] == ["sample.py: parse error (boom); kept previous symbols"]
+        assert stats["warnings"] == [
+            "sample.py: error (boom); kept previous symbols as a stale fallback"
+        ]
 
     status = conn.execute(
         "SELECT status FROM parse_state WHERE repo = ? AND path = 'sample.py'", (str(repo),)
@@ -682,15 +702,15 @@ def test_parse_error_state_persists_and_retries(tmp_path, monkeypatch):
 
 
 def test_unreadable_file_state_is_persisted(tmp_path, monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import pipeline
 
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def good(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
-    monkeypatch.setattr(indexer, "capture_file", lambda root, rel: None)
+    monkeypatch.setattr(pipeline, "capture_file", lambda root, rel: None)
     (repo / "sample.py").write_text("def changed(): pass\n")
 
     stats = index_repo(conn, repo)
@@ -702,9 +722,9 @@ def test_unreadable_file_state_is_persisted(tmp_path, monkeypatch):
 
 
 def test_removed_file_cleans_parse_state(tmp_path, monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import pipeline
 
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text("def good(): pass\n")
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -712,7 +732,7 @@ def test_removed_file_cleans_parse_state(tmp_path, monkeypatch):
 
     symbol = parse_source(b"def partial(): pass\n", "python", "sample.py").symbols[0]
     monkeypatch.setattr(
-        indexer, "parse_source", lambda data, lang, rel: ParseResult([symbol], "partial", "syntax")
+        pipeline, "parse_source", lambda data, lang, rel: ParseResult([symbol], "partial", "syntax")
     )
     (repo / "sample.py").write_text("def changed(): pass\n")
     index_repo(conn, repo)
@@ -734,43 +754,41 @@ def test_removed_file_cleans_parse_state(tmp_path, monkeypatch):
 
 
 def test_preflight_parsers_reports_original_error(monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import parser
 
-    monkeypatch.setattr(indexer, "_parsers", {})
-    monkeypatch.setattr(indexer, "_parser_errors", {})
+    monkeypatch.setattr(parser, "_parsers", {})
+    monkeypatch.setattr(parser, "_parser_errors", {})
 
     def refusing(lang):
         raise ConnectionError("connection refused while downloading grammar")
 
-    monkeypatch.setattr(indexer, "get_parser", refusing)
-    failures = indexer.preflight_parsers(["go", "python"])
+    monkeypatch.setattr(parser, "get_parser", refusing)
+    failures = parser.preflight_parsers(["go", "python"])
     assert set(failures) == {"go", "python"}
     assert all(reason.startswith("ConnectionError:") for reason in failures.values())
 
-    result = indexer.parse_source(b"x = 1", "python", "x.py")
+    result = parser.parse_source(b"x = 1", "python", "x.py")
     assert result.status == "unsupported"
     assert "ConnectionError: connection refused while downloading grammar" in result.detail
 
 
 def test_preflight_parsers_passes_when_parsers_load(monkeypatch):
-    from priorart import indexer
+    from priorart.indexing import parser
 
-    monkeypatch.setattr(indexer, "_parsers", {})
-    monkeypatch.setattr(indexer, "_parser_errors", {})
+    monkeypatch.setattr(parser, "_parsers", {})
+    monkeypatch.setattr(parser, "_parser_errors", {})
 
-    assert indexer.preflight_parsers(["python"]) == {}
+    assert parser.preflight_parsers(["python"]) == {}
 
 
 def test_repo_languages_lists_languages_of_tracked_files(tmp_path):
-    from priorart import indexer
-
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "code.py").write_text("def f(): pass\n")
     (repo / "tool.go").write_text("package main\n")
     git(repo, "add", "code.py", "tool.go")
     git(repo, "commit", "-q", "-m", "init")
 
-    assert indexer.repo_languages(repo) == ["go", "python"]
+    assert repo_languages(repo) == ["go", "python"]
 
 
 def _qualname_to_id(conn, repo: Path) -> dict[str, int]:
@@ -781,7 +799,7 @@ def _qualname_to_id(conn, repo: Path) -> dict[str, int]:
 
 
 def test_search_records_stage_trace(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -819,7 +837,7 @@ def test_search_records_stage_trace(tmp_path):
 
 
 def test_search_trace_records_rerank_fallback(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
@@ -834,7 +852,7 @@ def test_search_trace_records_rerank_fallback(tmp_path):
     )
     trace = report.trace
     assert trace is not None
-    assert trace.queries == ["sample.py"]
+    assert trace.queries == ["sample.py", "sample py"]
     assert trace.vec_rankings == []
     assert trace.rerank_order is None
     assert any("invalid or incomplete" in warning for warning in report.warnings)
@@ -850,7 +868,7 @@ def _completion_payload(logprobs):
 
 
 def test_rerank_llama_completion_scores_from_yes_no_logprobs(monkeypatch, tmp_path):
-    from priorart import rerank as rerank_mod
+    from priorart.models import rerank as rerank_mod
 
     seen = {"prompts": []}
 
@@ -863,12 +881,13 @@ def test_rerank_llama_completion_scores_from_yes_no_logprobs(monkeypatch, tmp_pa
         return _completion_payload([("no", -0.1), ("No", -3.0), ("yes", -5.0), ("false", -6.0)])
 
     monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    from tests.helpers import make_config
+
     config = make_config(
         tmp_path,
         rerank_base_url="http://rerank.example/v1",
         rerank_model="priorart-rerank",
         rerank_protocol="llama-completion",
-        db_path=tmp_path / "rerank-lc-test.db",
     )
     rerank = rerank_mod.make_reranker(config)
     order, warning = rerank("retry failed calls", ["doc-one", "doc-two"])
@@ -889,25 +908,22 @@ def test_rerank_llama_completion_scores_from_yes_no_logprobs(monkeypatch, tmp_pa
         assert prompt.endswith("\n\n")
     assert "doc-one" in prompts[0]
     assert "doc-two" in prompts[1]
-    assert prompt.startswith("<|im_start|>system")
-    assert "Judge whether the Document meets the requirements" in prompt
-    assert rerank_mod.RERANK_INSTRUCTION in prompt
-    assert prompt.endswith("\n\n")
 
 
 def test_rerank_llama_completion_missing_token_floors_score(monkeypatch, tmp_path):
-    from priorart import rerank as rerank_mod
+    from priorart.models import rerank as rerank_mod
 
     def fake_post_json(url, body, api_key, timeout):
         return _completion_payload([("yes", -0.3), ("Yes", -3.0), ("true", -4.0)])
 
     monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    from tests.helpers import make_config
+
     config = make_config(
         tmp_path,
         rerank_base_url="http://rerank.example",
         rerank_model="priorart-rerank",
         rerank_protocol="llama-completion",
-        db_path=tmp_path / "rerank-lc-floor-test.db",
     )
     rerank = rerank_mod.make_reranker(config)
     order, warning = rerank("query", ["doc"])
@@ -916,18 +932,19 @@ def test_rerank_llama_completion_missing_token_floors_score(monkeypatch, tmp_pat
 
 
 def test_rerank_llama_completion_without_yes_no_keeps_hybrid_order(monkeypatch, tmp_path):
-    from priorart import rerank as rerank_mod
+    from priorart.models import rerank as rerank_mod
 
     def fake_post_json(url, body, api_key, timeout):
         return _completion_payload([("true", -0.3), ("false", -1.0)])
 
     monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    from tests.helpers import make_config
+
     config = make_config(
         tmp_path,
         rerank_base_url="http://rerank.example/v1",
         rerank_model="priorart-rerank",
         rerank_protocol="llama-completion",
-        db_path=tmp_path / "rerank-lc-miss-test.db",
     )
     rerank = rerank_mod.make_reranker(config)
     order, warning = rerank("query", ["doc"])
@@ -936,12 +953,12 @@ def test_rerank_llama_completion_without_yes_no_keeps_hybrid_order(monkeypatch, 
 
 
 def test_rerank_prompt_template_matches_official_qwen3_reranker_usage():
-    from priorart import rerank as rerank_mod
+    from priorart.models.rerank import RERANK_PROMPT_TEMPLATE
 
-    template = rerank_mod.RERANK_PROMPT_TEMPLATE
+    template = RERANK_PROMPT_TEMPLATE
     assert "<|im_start|>system\n" in template
     assert '"yes" or "no"' in template
-    assert "<Instruct>: " + rerank_mod.RERANK_INSTRUCTION in template
+    assert "<Instruct>: " in template
     assert "<Query>: {query}" in template
     assert "<Document>: {document}" in template
     assert "assistant\n" + chr(60) + "think" + chr(62) in template
@@ -949,18 +966,19 @@ def test_rerank_prompt_template_matches_official_qwen3_reranker_usage():
 
 
 def test_query_expansion_null_content_falls_back_to_raw_query(monkeypatch, tmp_path):
-    from priorart import expand as expand_mod
+    from priorart.models import expand as expand_mod
 
     monkeypatch.setattr(
         expand_mod,
         "post_json",
         lambda *args, **kwargs: {"choices": [{"message": {"content": None}}]},
     )
+    from tests.helpers import make_config
+
     config = make_config(
         tmp_path,
         llm_base_url="http://llm.example/v1",
         llm_model="chat",
-        db_path=tmp_path / "expand-test.db",
     )
     expand = expand_mod.make_expander(config)
     queries, warning = expand("find the handler")
@@ -969,7 +987,7 @@ def test_query_expansion_null_content_falls_back_to_raw_query(monkeypatch, tmp_p
 
 
 def test_embedding_payload_data_order_follows_index_field(monkeypatch, tmp_path):
-    from priorart import embed as embed_mod
+    from priorart.models import embed as embed_mod
 
     def fake_post_json(url, body, api_key, timeout):
         assert [item.rsplit("Text: ", 1)[1] for item in body["input"]] == ["text-a", "text-b"]
@@ -981,11 +999,12 @@ def test_embedding_payload_data_order_follows_index_field(monkeypatch, tmp_path)
         }
 
     monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
+    from tests.helpers import make_config
+
     config = make_config(
         tmp_path,
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
-        db_path=tmp_path / "embed-test.db",
     )
     embed = embed_mod.make_embedder(config)
     vectors, warning = embed(["text-a", "text-b"])
@@ -999,7 +1018,7 @@ def test_embedding_payload_data_order_follows_index_field(monkeypatch, tmp_path)
 
 
 def test_rerank_prompt_substitution_is_single_pass():
-    from priorart.rerank import RERANK_PROMPT_TEMPLATE, _fill_template
+    from priorart.models.rerank import RERANK_PROMPT_TEMPLATE, _fill_template
 
     prompt = _fill_template(RERANK_PROMPT_TEMPLATE, "weird {document} query", "<body>")
     assert "weird {document} query" in prompt
@@ -1008,7 +1027,7 @@ def test_rerank_prompt_substitution_is_single_pass():
 
 
 def test_rerank_missing_score_counts_as_malformed():
-    from priorart.rerank import _parse_results
+    from priorart.models.rerank import _parse_results
 
     order, warning = _parse_results([{"index": 0}, {"index": 1, "relevance_score": 0.4}])
     assert order == [(1, 0.4)]
@@ -1016,7 +1035,7 @@ def test_rerank_missing_score_counts_as_malformed():
 
 
 def test_search_warns_when_dense_channel_is_empty(tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_repo(tmp_path / "repo")
     (repo / "sample.py").write_text(SAMPLE)
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")

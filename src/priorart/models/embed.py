@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 
 import sqlite_vec
 
-from .config import Config
+from priorart.core import APP_VERSION, Config
+
 from .httputil import REQUEST_ERRORS, post_json
 
 BATCH = 32
@@ -19,6 +22,30 @@ QUERY_INSTRUCTION = (
     "and methods in this repository that could be reused or extended instead "
     "of writing new code."
 )
+
+
+def embedding_space_id(config: Config) -> str:
+    """Identity of the embedding space one configuration produces.
+
+    The model name and dimension alone do not define a space: the endpoint,
+    input formatting, instructions and normalization change the meaning of
+    vectors. Every input that shapes the produced bytes is hashed here, so a
+    template or instruction edit invalidates cached vectors automatically.
+    """
+
+    profile = {
+        "app_version": APP_VERSION,
+        "base_url": config.embed_base_url,
+        "model": config.embed_model,
+        "dim": config.embed_dim,
+        "input_format": config.embed_input_format,
+        "document_instruction": DOCUMENT_INSTRUCTION,
+        "query_instruction": QUERY_INSTRUCTION,
+        "normalized": config.embed_input_format == "qwen3",
+    }
+    return hashlib.sha256(
+        json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _instruct(instruction: str, text: str) -> str:

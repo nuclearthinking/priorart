@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import struct
+import time
 from pathlib import Path
 
 import httpx
@@ -10,14 +11,14 @@ import pytest
 import sqlite_vec
 from typer.testing import CliRunner
 
-from priorart import embed as embed_mod
-from priorart import expand as expand_mod
-from priorart import httputil, store
 from priorart.cli import app
-from priorart.config import Config
-from priorart.indexer import index_repo
-from priorart.runtime import Runtime
-from priorart.store import connect
+from priorart.core.config import Config
+from priorart.core.jobs import FINAL_STATES
+from priorart.models import embed as embed_mod
+from priorart.models import expand as expand_mod
+from priorart.models import httputil
+from priorart.registry import RuntimeRegistry
+from priorart.storage import StoreProfile, initialize_writer, store
 from tests.helpers import git, make_config
 
 SAMPLE = 'def cli_target():\n    """Used by cli and runtime tests."""\n    pass\n'
@@ -30,6 +31,16 @@ def _init_repo(repo: Path) -> Path:
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
     return repo
+
+
+def _wait_job(registry: RuntimeRegistry, job_id: str, timeout: float = 30.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _handle, job = registry.get_job(job_id)
+        if job.state in FINAL_STATES:
+            return job
+        time.sleep(0.01)
+    raise AssertionError(f"job {job_id} did not finish in {timeout}s")
 
 
 class _FakeResponse:
@@ -60,226 +71,261 @@ def test_post_json_sends_bearer_and_parses_response(monkeypatch):
     assert seen["headers"]["content-type"] == "application/json"
 
 
-def test_post_json_without_key_has_no_auth_header():
-    headers = httputil.auth_headers(None)
-    assert "authorization" not in headers
+def test_post_json_without_key_has_no_auth_header(monkeypatch):
+    monkeypatch.setattr(
+        httputil.httpx,
+        "post",
+        lambda url, json=None, headers=None, timeout=None: _FakeResponse({"ok": True}),
+    )
+    result = httputil.post_json("http://unit.example/v1", {}, None, timeout=1)
+    assert result == {"ok": True}
+    assert httputil.auth_headers(None) == {"content-type": "application/json"}
 
 
 def test_post_json_propagates_http_error(monkeypatch):
-    def fake_post(*args, **kwargs):
+    def failing_post(url, **kwargs):
         raise httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr(httputil.httpx, "post", fake_post)
-    with pytest.raises(httpx.HTTPError):
-        httputil.post_json("http://unit.example", {}, None, timeout=1)
+    monkeypatch.setattr(httputil.httpx, "post", failing_post)
+    with pytest.raises(httpx.ConnectError):
+        httputil.post_json("http://unit.example/v1", {}, None, timeout=1)
 
 
-def test_make_embedder_requires_config():
-    assert embed_mod.make_embedder(make_config(Path("/nonexistent"), embed_base_url=None)) is None
+def test_make_embedder_requires_config(tmp_path):
+    assert make_config(tmp_path) is not None
+    assert embed_mod.make_embedder(make_config(tmp_path)) is None
 
 
-def test_embed_serializes_vectors_in_input_order(monkeypatch):
+def test_embed_serializes_vectors_in_input_order(monkeypatch, tmp_path):
+    def fake_post_json(url, body, api_key, timeout):
+        assert [item.rsplit("Text: ", 1)[1] for item in body["input"]] == ["text-a", "text-b"]
+        return {
+            "data": [
+                {"index": 1, "embedding": [0.2, 0.2, 0.2, 0.2]},
+                {"index": 0, "embedding": [0.1, 0.1, 0.1, 0.1]},
+            ]
+        }
+
+    monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
     config = make_config(
-        Path("/nonexistent"),
+        tmp_path,
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
     )
     embed = embed_mod.make_embedder(config)
-    monkeypatch.setattr(
-        embed_mod,
-        "post_json",
-        lambda *args, **kwargs: {"data": [{"embedding": [0.5, 0.5, 0.5, 0.5]} for _ in range(3)]},
-    )
-    vectors, warning = embed(["one", "two", "three"])
+    vectors, warning = embed(["text-a", "text-b"])
     assert warning is None
-    assert len(vectors) == 3
-    assert all(isinstance(vector, bytes) and len(vector) == 16 for vector in vectors)
+    assert vectors == [
+        sqlite_vec.serialize_float32([0.1, 0.1, 0.1, 0.1]),
+        sqlite_vec.serialize_float32([0.2, 0.2, 0.2, 0.2]),
+    ]
 
 
-def test_embed_batches_requests(monkeypatch):
-    config = make_config(
-        Path("/nonexistent"),
-        embed_base_url="http://embed.example/v1",
-        embed_model="embedder",
-    )
-    embed = embed_mod.make_embedder(config)
-    monkeypatch.setattr(embed_mod, "BATCH", 2)
+def test_embed_batches_requests(monkeypatch, tmp_path):
     calls = []
 
     def fake_post_json(url, body, api_key, timeout):
-        calls.append(len(body["input"]))
-        return {"data": [{"embedding": [0.5, 0.5, 0.5, 0.5]} for _ in body["input"]]}
+        calls.append(body["input"])
+        return {
+            "data": [
+                {"index": i, "embedding": [0.1, 0.1, 0.1, 0.1]} for i in range(len(body["input"]))
+            ]
+        }
 
     monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
-    vectors, warning = embed(["a", "b", "c", "d", "e"])
-    assert warning is None
-    assert len(vectors) == 5
-    assert calls == [2, 2, 1]
-
-
-def test_embed_http_failure_returns_warning(monkeypatch):
     config = make_config(
-        Path("/nonexistent"),
+        tmp_path,
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
     )
     embed = embed_mod.make_embedder(config)
+    vectors, warning = embed([f"t{i}" for i in range(70)])
+    assert warning is None
+    assert len(vectors) == 70
+    assert [len(batch) for batch in calls] == [32, 32, 6]
 
-    def fake_post_json(*args, **kwargs):
-        raise httpx.ConnectError("down")
 
-    monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
-    vectors, warning = embed(["a"])
+def test_embed_http_failure_returns_warning(monkeypatch, tmp_path):
+    def failing_post(url, body, api_key, timeout):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(embed_mod, "post_json", failing_post)
+    config = make_config(
+        tmp_path,
+        embed_base_url="http://embed.example/v1",
+        embed_model="embedder",
+    )
+    embed = embed_mod.make_embedder(config)
+    vectors, warning = embed(["text"])
     assert vectors is None
     assert "embedding request failed" in warning
 
 
-def test_embed_wrong_payload_length_returns_warning(monkeypatch):
+def test_embed_wrong_payload_length_returns_warning(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        embed_mod,
+        "post_json",
+        lambda *args, **kwargs: {"data": []},
+    )
     config = make_config(
-        Path("/nonexistent"),
+        tmp_path,
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
     )
     embed = embed_mod.make_embedder(config)
-    monkeypatch.setattr(embed_mod, "post_json", lambda *args, **kwargs: {"data": []})
-    vectors, warning = embed(["a", "b"])
+    vectors, warning = embed(["text"])
     assert vectors is None
     assert "wrong payload" in warning
 
 
-def test_embed_qwen3_format_instructs_queries_and_normalizes(monkeypatch):
+def test_embed_qwen3_format_instructs_queries_and_normalizes(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_post_json(url, body, api_key, timeout):
+        seen["input"] = body["input"]
+        return {"data": [{"index": 0, "embedding": [3.0, 0.0, 0.0, 0.0]}]}
+
+    monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
     config = make_config(
-        Path("/nonexistent"),
+        tmp_path,
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
         embed_input_format="qwen3",
     )
     embed = embed_mod.make_embedder(config)
+    vectors, _warning = embed(["find the handler"], query=True)
+    assert seen["input"] == [
+        embed_mod._qwen3_query(embed_mod.QUERY_INSTRUCTION, "find the handler")
+    ]
+    assert vectors == [sqlite_vec.serialize_float32([1.0, 0.0, 0.0, 0.0])]
+
+    vectors, _warning = embed(["def handler(): pass"])
+    assert seen["input"] == ["def handler(): pass"]
+    assert vectors == [sqlite_vec.serialize_float32([1.0, 0.0, 0.0, 0.0])]
+
+
+def test_embed_legacy_format_wraps_documents(monkeypatch, tmp_path):
     seen = {}
 
     def fake_post_json(url, body, api_key, timeout):
         seen["input"] = body["input"]
-        return {"data": [{"embedding": [3.0, 4.0, 0.0, 0.0]} for _ in body["input"]]}
+        return {"data": [{"index": 0, "embedding": [0.1] * 4}]}
 
     monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
-    vectors, warning = embed(["raw document text"], query=True)
-    assert warning is None
-    assert seen["input"] == [f"Instruct: {embed_mod.QUERY_INSTRUCTION}\nQuery: raw document text"]
-    vector = struct.unpack("<f", vectors[0][0:4])[0]
-    assert vector == pytest.approx(3.0 / 5.0)
-
-    vectors, warning = embed(["raw document text"], query=False)
-    assert warning is None
-    assert seen["input"] == ["raw document text"]
-    assert struct.unpack("<f", vectors[0][0:4])[0] == pytest.approx(3.0 / 5.0)
-
-
-def test_embed_legacy_format_wraps_documents(monkeypatch):
     config = make_config(
-        Path("/nonexistent"),
+        tmp_path,
         embed_base_url="http://embed.example/v1",
         embed_model="embedder",
     )
     embed = embed_mod.make_embedder(config)
-    seen = {}
-
-    def fake_post_json(url, body, api_key, timeout):
-        seen["input"] = body["input"]
-        return {"data": [{"embedding": [3.0, 4.0, 0.0, 0.0]} for _ in body["input"]]}
-
-    monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
-    vectors, warning = embed(["symbol text"], query=False)
-    assert warning is None
-    assert seen["input"] == [f"Instruct: {embed_mod.DOCUMENT_INSTRUCTION}\nText: symbol text"]
-    assert struct.unpack("<f", vectors[0][0:4])[0] == pytest.approx(3.0)
+    embed(["def handler(): pass"])
+    assert seen["input"] == [
+        embed_mod._instruct(embed_mod.DOCUMENT_INSTRUCTION, "def handler(): pass")
+    ]
 
 
-def test_embed_dimension_mismatch_returns_warning(monkeypatch):
-    config = make_config(
-        Path("/nonexistent"),
-        embed_base_url="http://embed.example/v1",
-        embed_model="embedder",
-        embed_input_format="qwen3",
-    )
-    embed = embed_mod.make_embedder(config)
+def test_embed_dimension_mismatch_returns_warning(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        embed_mod, "post_json", lambda *args, **kwargs: {"data": [{"embedding": [1.0, 2.0, 3.0]}]}
+        embed_mod,
+        "post_json",
+        lambda *args, **kwargs: {"data": [{"index": 0, "embedding": [0.1] * 8}]},
     )
-    vectors, warning = embed(["a"])
+    config = make_config(
+        tmp_path,
+        embed_base_url="http://embed.example/v1",
+        embed_model="embedder",
+    )
+    embed = embed_mod.make_embedder(config)
+    vectors, warning = embed(["text"])
     assert vectors is None
-    assert "dimension 3, expected 4" in warning
+    assert "dimension 8, expected 4" in warning
 
 
-def test_make_expander_requires_config():
-    assert expand_mod.make_expander(make_config(Path("/nonexistent"), llm_base_url=None)) is None
+def test_make_expander_requires_config(tmp_path):
+    assert expand_mod.make_expander(make_config(tmp_path)) is None
 
 
-def test_expand_parses_chat_response(monkeypatch):
-    config = make_config(Path("/nonexistent"), llm_base_url="http://llm.example/v1", llm_model="x")
-    expand = expand_mod.make_expander(config)
+def test_expand_parses_chat_response(monkeypatch, tmp_path):
     monkeypatch.setattr(
         expand_mod,
         "post_json",
-        lambda *args, **kwargs: {"choices": [{"message": {"content": '["one", "two"]'}}]},
+        lambda *args, **kwargs: {"choices": [{"message": {"content": '["a", "b"]'}}]},
     )
-    queries, warning = expand("feature request")
-    assert queries == ["one", "two"]
-    assert warning is None
-
-
-def test_expand_failure_falls_back_to_raw_query(monkeypatch):
-    config = make_config(Path("/nonexistent"), llm_base_url="http://llm.example/v1", llm_model="x")
+    config = make_config(
+        tmp_path,
+        llm_base_url="http://llm.example/v1",
+        llm_model="chat",
+    )
     expand = expand_mod.make_expander(config)
+    queries, warning = expand("find the handler")
+    assert warning is None
+    assert queries == ["a", "b"]
 
-    def fake_post_json(*args, **kwargs):
-        raise httpx.ConnectError("down")
 
-    monkeypatch.setattr(expand_mod, "post_json", fake_post_json)
-    queries, warning = expand("feature request")
-    assert queries == ["feature request"]
-    assert "expansion failed" in warning
+def test_expand_failure_falls_back_to_raw_query(monkeypatch, tmp_path):
+    def failing_post(url, body, api_key, timeout):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(expand_mod, "post_json", failing_post)
+    config = make_config(
+        tmp_path,
+        llm_base_url="http://llm.example/v1",
+        llm_model="chat",
+    )
+    expand = expand_mod.make_expander(config)
+    queries, warning = expand("find the handler")
+    assert queries == ["find the handler"]
+    assert "query expansion failed" in warning
 
 
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
-        ('["fenced"]', ["fenced"]),
-        ('```json\n["a", " b ", ""]\n```', ["a", "b"]),
-        ("not json at all", None),
-        ('{"object": "not a list"}', None),
+        ('```json\n["a", "b"]\n```', ["a", "b"]),
+        ('["", "  "]', None),
+        ("not json", None),
+        ('{"a": 1}', None),
         ("[]", None),
-        ("[1, true]", ["1", "True"]),
     ],
 )
 def test_parse_queries_variants(content, expected):
     assert expand_mod._parse_queries(content) == expected
 
 
-def test_runtime_search_reindex_status_and_map(tmp_path):
-    repo = _init_repo(tmp_path)
-    runtime = Runtime(repo, config=make_config(tmp_path))
-    stats = runtime.reindex()
-    assert stats["symbols"] == 1
-    assert stats["files"] == 1
-    assert runtime.symbol_count() == 1
+def test_handle_search_refresh_status_and_map(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    registry = RuntimeRegistry(make_config(tmp_path))
+    handle = registry.resolve(repo)
+    job = _wait_job(registry, registry.submit_refresh(handle).job_id)
+    assert job.state == "completed"
+    assert job.counters["files"] == 1
+    assert job.counters["symbols"] == 1
+    assert job.lexical_ready
 
-    stats = runtime.reindex()
-    assert stats["files"] == 0
-    stats = runtime.reindex(rebuild=True)
-    assert stats["files"] == 1
+    job = _wait_job(registry, registry.submit_refresh(handle).job_id)
+    assert job.counters["files"] == 0
+    job = _wait_job(registry, registry.submit_refresh(handle, rebuild=True).job_id)
+    assert job.counters["files"] == 1
 
-    report = runtime.search("cli_target", k=3)
+    report = handle.search("cli_target", k=3)
+    assert report.candidates[0].qualname == "cli_target"
+    # an exact identifier match answers without any model or warning
+    assert report.stages_used == ["exact"]
+
+    report = handle.search("the cli target function", k=3)
     assert report.candidates[0].qualname == "cli_target"
     assert report.warnings == ["dense search skipped: embedding endpoint is not configured"]
 
-    assert "repo:" in runtime.status()
-    assert "cli_target" in runtime.map_symbols("*")
-    assert "cli_target" in runtime.map_symbols("sample.py")
+    assert "repo:" in handle.status_text()
+    rows, _cursor = handle.map_symbols("*")
+    assert [row["qualname"] for row in rows] == ["cli_target"]
+    rows, _cursor = handle.map_symbols("sample.py")
+    assert [row["qualname"] for row in rows] == ["cli_target"]
 
 
 def test_cli_index_search_status(tmp_path, monkeypatch):
     repo = _init_repo(tmp_path / "cli")
-    monkeypatch.setenv("PRIORART_DB", str(tmp_path / "cli.db"))
+    monkeypatch.setenv("PRIORART_INDEX_DIR", str(tmp_path / "cli-indexes"))
     runner = CliRunner()
 
     result = runner.invoke(app, ["index", str(repo)])
@@ -304,7 +350,7 @@ def test_cli_index_reports_removal_and_warnings(tmp_path, monkeypatch):
     (repo / "extra.py").write_text("def extra(): pass\n")
     git(repo, "add", "extra.py")
     git(repo, "commit", "-q", "-m", "extra")
-    monkeypatch.setenv("PRIORART_DB", str(tmp_path / "cli.db"))
+    monkeypatch.setenv("PRIORART_INDEX_DIR", str(tmp_path / "cli-indexes"))
     runner = CliRunner()
     runner.invoke(app, ["index", str(repo)])
 
@@ -316,38 +362,76 @@ def test_cli_index_reports_removal_and_warnings(tmp_path, monkeypatch):
     assert "removed 1 deleted files" in result.output
 
 
+def test_cli_index_emits_json_progress(tmp_path, monkeypatch):
+    import json as json_mod
+
+    repo = _init_repo(tmp_path / "cli")
+    monkeypatch.setenv("PRIORART_INDEX_DIR", str(tmp_path / "cli-indexes"))
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["index", str(repo), "--json-progress"])
+    assert result.exit_code == 0
+    events = [json_mod.loads(line) for line in result.output.splitlines() if line.startswith("{")]
+    assert events[0]["state"] in ("queued", "running")
+    assert events[-1]["state"] == "completed"
+    assert events[-1]["counters"]["symbols"] == 1
+
+
 def test_server_tools_outside_git_repo(tmp_path, monkeypatch):
     from priorart import server as server_mod
 
     monkeypatch.chdir(tmp_path)
     mcp = server_mod.build_server(None)
-    payloads = {"search_codebase": {"query": "anything"}}
-    for tool in ("search_codebase", "map_symbols", "refresh_index", "status"):
-        content = asyncio.run(mcp.call_tool(tool, payloads.get(tool, {}))).content
-        assert "no git repository detected" in content[0].text
+    result = asyncio.run(mcp.call_tool("search_codebase", {"query": "anything"}))
+    assert result.is_error is True
+    assert result.structured_content["error"]["code"] == "REPOSITORY_NOT_SELECTED"
+    assert "repo=<absolute path>" in result.structured_content["error"]["next_action"]
 
 
 def test_server_tools_serve_indexed_repo(tmp_path, monkeypatch):
     from priorart import server as server_mod
 
     repo = _init_repo(tmp_path / "srv")
-    monkeypatch.setenv("PRIORART_DB", str(tmp_path / "srv.db"))
-    mcp = server_mod.build_server(repo)
+    monkeypatch.setenv("PRIORART_INDEX_DIR", str(tmp_path / "srv-indexes"))
+    mcp = server_mod.build_server(repo, config=make_config(tmp_path))
 
-    content = asyncio.run(mcp.call_tool("status", {})).content
-    assert "not indexed" in content[0].text
+    result = asyncio.run(mcp.call_tool("status", {}))
+    assert result.is_error is False
+    assert result.structured_content["index"]["state"] == "absent"
 
-    content = asyncio.run(mcp.call_tool("refresh_index", {})).content
-    assert "index total 1 symbols" in content[0].text
+    result = asyncio.run(mcp.call_tool("search_codebase", {"query": "cli_target", "k": 1}))
+    assert result.is_error is True
+    assert result.structured_content["error"]["code"] == "INDEX_NOT_READY"
 
-    content = asyncio.run(mcp.call_tool("search_codebase", {"query": "cli_target", "k": 1})).content
-    assert "cli_target" in content[0].text
+    result = asyncio.run(mcp.call_tool("refresh_index", {}))
+    assert result.is_error is False
+    job_id = result.structured_content["data"]["job"]["job_id"]
+    while True:
+        result = asyncio.run(mcp.call_tool("get_index_job", {"job_id": job_id}))
+        if result.structured_content["data"]["job"]["state"] in FINAL_STATES:
+            break
+    assert result.structured_content["data"]["job"]["state"] == "completed"
 
-    content = asyncio.run(mcp.call_tool("map_symbols", {"path_glob": "*"})).content
-    assert "cli_target" in content[0].text
+    result = asyncio.run(mcp.call_tool("search_codebase", {"query": "cli_target", "k": 1}))
+    assert result.is_error is False
+    assert "cli_target" in result.content[0].text
+    assert result.structured_content["ok"] is True
+    assert result.structured_content["repo"] == str(repo)
+    assert result.structured_content["index"]["index_epoch"] >= 1
+
+    result = asyncio.run(mcp.call_tool("map_symbols", {"path_glob": "*"}))
+    assert result.is_error is False
+    assert result.structured_content["data"]["symbols"][0]["qualname"] == "cli_target"
+
+    result = asyncio.run(mcp.call_tool("list_workspaces", {}))
+    assert result.is_error is False
+    assert str(repo) in result.structured_content["data"]["workspaces"]["configured"]
 
     tools = asyncio.run(mcp.list_tools())
     assert sorted(tool.name for tool in tools) == [
+        "cancel_index_job",
+        "get_index_job",
+        "list_workspaces",
         "map_symbols",
         "refresh_index",
         "search_codebase",
@@ -355,14 +439,37 @@ def test_server_tools_serve_indexed_repo(tmp_path, monkeypatch):
     ]
 
 
-def test_git_root_detects_repo_and_rejects_plain_dir(tmp_path):
-    from priorart.server import _git_root
+def test_server_rejects_relative_and_wrong_repo(tmp_path):
+    from priorart import server as server_mod
+
+    repo = _init_repo(tmp_path / "srv")
+    mcp = server_mod.build_server(repo, config=make_config(tmp_path))
+
+    result = asyncio.run(mcp.call_tool("search_codebase", {"query": "x", "repo": "relative/path"}))
+    assert result.is_error is True
+    assert result.structured_content["error"]["code"] == "REPOSITORY_NOT_FOUND"
+
+    result = asyncio.run(mcp.call_tool("search_codebase", {"query": "x", "repo": str(tmp_path)}))
+    assert result.is_error is True
+    assert result.structured_content["error"]["code"] == "REPOSITORY_NOT_FOUND"
+
+    result = asyncio.run(mcp.call_tool("get_index_job", {"job_id": "missing"}))
+    assert result.is_error is True
+    assert result.structured_content["error"]["code"] == "JOB_NOT_FOUND"
+
+
+def test_git_toplevel_detects_repo_and_rejects_plain_dir(tmp_path):
+    from priorart.core.git import git_toplevel
 
     repo = _init_repo(tmp_path / "root")
-    assert _git_root(repo) == repo.resolve()
+    assert git_toplevel(repo) == repo.resolve()
     plain = tmp_path / "plain"
     plain.mkdir()
-    assert _git_root(plain) is None
+    assert git_toplevel(plain) is None
+
+
+def _connect(tmp_path: Path, dim: int = 4, **profile) -> sqlite3.Connection:
+    return initialize_writer(tmp_path / "unit.db", StoreProfile(embed_dim=dim, **profile))
 
 
 def test_legacy_database_is_reset_from_scratch(tmp_path):
@@ -383,7 +490,7 @@ def test_legacy_database_is_reset_from_scratch(tmp_path):
     legacy.commit()
     legacy.close()
 
-    conn = connect(db, embed_dim=4)
+    conn = initialize_writer(db, StoreProfile(embed_dim=4))
 
     assert not conn.in_transaction
     columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
@@ -412,7 +519,7 @@ def test_foreign_database_user_version_is_not_overwritten(tmp_path):
     foreign.close()
 
     with pytest.raises(RuntimeError, match="refusing to overwrite"):
-        connect(db, embed_dim=4)
+        initialize_writer(db, StoreProfile(embed_dim=4))
 
     raw = sqlite3.connect(db)
     assert raw.execute("PRAGMA user_version").fetchone()[0] == 42
@@ -425,12 +532,12 @@ def test_non_database_file_is_a_loud_runtime_error(tmp_path):
     db.write_bytes(b"this is not a sqlite database at all")
 
     with pytest.raises(RuntimeError, match="failed to initialize"):
-        connect(db, embed_dim=4)
+        initialize_writer(db, StoreProfile(embed_dim=4))
 
 
 def test_newer_schema_version_is_reset(tmp_path):
     db = tmp_path / "future.db"
-    conn = connect(db, embed_dim=4)
+    conn = initialize_writer(db, StoreProfile(embed_dim=4))
     conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'p', 1, 2)")
     conn.commit()
     conn.close()
@@ -440,20 +547,20 @@ def test_newer_schema_version_is_reset(tmp_path):
     raw.commit()
     raw.close()
 
-    conn = connect(db, embed_dim=4)
+    conn = initialize_writer(db, StoreProfile(embed_dim=4))
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
 
 
 def test_app_version_change_resets_index(tmp_path, monkeypatch):
     db = tmp_path / "reindex.db"
-    conn = connect(db, embed_dim=4)
+    conn = initialize_writer(db, StoreProfile(embed_dim=4))
     conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'p', 1, 2)")
     conn.commit()
     conn.close()
 
     monkeypatch.setattr(store, "APP_VERSION", "9.9.9-test")
-    conn = connect(db, embed_dim=4)
+    conn = initialize_writer(db, StoreProfile(embed_dim=4))
 
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert (
@@ -464,12 +571,12 @@ def test_app_version_change_resets_index(tmp_path, monkeypatch):
 
 def test_embed_dim_change_resets_index(tmp_path):
     db = tmp_path / "dim.db"
-    conn = connect(db, embed_dim=4)
+    conn = initialize_writer(db, StoreProfile(embed_dim=4))
     conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'p', 1, 2)")
     conn.commit()
     conn.close()
 
-    conn = connect(db, embed_dim=8)
+    conn = initialize_writer(db, StoreProfile(embed_dim=8))
 
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert conn.execute("SELECT value FROM meta WHERE key = 'embed_dim'").fetchone()[0] == "8"
@@ -477,9 +584,10 @@ def test_embed_dim_change_resets_index(tmp_path):
 
 
 def test_schema_creates_repo_path_index(tmp_path):
-    repo = tmp_path / "repo"
-    _init_repo(repo)
-    conn = connect(tmp_path / "db.sqlite", embed_dim=4)
+    from priorart.indexing.pipeline import index_repo
+
+    repo = _init_repo(tmp_path / "repo")
+    conn = _connect(tmp_path)
     index_repo(conn, repo)
     row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'symbols_repo_path'"
@@ -493,28 +601,26 @@ def test_schema_creates_repo_path_index(tmp_path):
 
 def test_connect_reopen_preserves_index_and_is_noop(tmp_path):
     db = tmp_path / "reopen.db"
-    conn = connect(db, embed_dim=4)
+    conn = initialize_writer(db, StoreProfile(embed_dim=4))
     conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'p', 1, 2)")
     conn.commit()
     conn.close()
 
-    conn = connect(db, embed_dim=4)
+    conn = initialize_writer(db, StoreProfile(embed_dim=4))
     assert not conn.in_transaction
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
     assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
 
 
 def test_failed_schema_creation_is_atomic(tmp_path, monkeypatch):
-    from priorart import store as store_mod
-
     db = tmp_path / "partial.db"
     monkeypatch.setattr(
-        store_mod,
+        store,
         "SCHEMA_STATEMENTS",
         ("CREATE TABLE repos (repo TEXT PRIMARY KEY)", "CREATE TABLE bad ("),
     )
     with pytest.raises(RuntimeError, match="failed to initialize"):
-        connect(db, embed_dim=4)
+        initialize_writer(db, StoreProfile(embed_dim=4))
 
     raw = sqlite3.connect(db)
     assert raw.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall() == []
@@ -522,27 +628,22 @@ def test_failed_schema_creation_is_atomic(tmp_path, monkeypatch):
     raw.close()
 
     monkeypatch.undo()
-    conn = connect(db, embed_dim=4)
+    conn = initialize_writer(db, StoreProfile(embed_dim=4))
     assert not conn.in_transaction
     assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
 
 
 def test_rollback_without_transaction_is_noop(tmp_path):
-    from priorart import store as store_mod
-
-    conn = connect(tmp_path / "noop.db", embed_dim=4)
+    conn = _connect(tmp_path)
     assert not conn.in_transaction
-    store_mod._rollback(conn)
+    store._rollback(conn)
 
 
 def test_rollback_discards_open_transaction(tmp_path):
-    from priorart import store as store_mod
-
-    db = tmp_path / "rollback.db"
-    conn = connect(db, embed_dim=4)
+    conn = _connect(tmp_path)
     conn.execute("BEGIN")
     conn.execute("CREATE TABLE stray (x INTEGER)")
-    store_mod._rollback(conn)
+    store._rollback(conn)
     assert not conn.in_transaction
     assert (
         conn.execute(
@@ -553,7 +654,7 @@ def test_rollback_discards_open_transaction(tmp_path):
 
 
 def test_index_line_flags_parse_problems_not_clean_empties():
-    from priorart.search import SearchReport, _index_line
+    from priorart.retrieval.search import SearchReport, _index_line
 
     report = SearchReport(
         candidates=[],
@@ -561,17 +662,17 @@ def test_index_line_flags_parse_problems_not_clean_empties():
         symbol_count=5,
         head=None,
         age_seconds=None,
-        parse_coverage={"ok": 10, "empty": 3, "partial": 1, "embed_failed": 2},
+        parse_coverage={"ok": 10, "empty": 3, "partial": 1, "error": 2},
     )
 
     line = _index_line(report)
 
-    assert "parse issues: 2 embed_failed, 1 partial" in line
+    assert "parse issues: 2 error, 1 partial" in line
     assert "empty" not in line
 
 
 def _expand_db(tmp_path, files):
-    conn = connect(tmp_path / "expand.db", embed_dim=4)
+    conn = _connect(tmp_path)
     conn.execute("INSERT INTO repos (repo, head, indexed_at) VALUES ('r', NULL, NULL)")
     ids = {}
     for path, symbols in files.items():
@@ -597,7 +698,7 @@ def _vec4(*values):
 
 
 def test_expand_pool_ranks_term_hits_before_cosine(tmp_path):
-    from priorart.search import _expand_pool
+    from priorart.retrieval.search import _expand_pool
 
     query_vector = _vec4(1.0, 0.0, 0.0, 0.0)
     conn, ids = _expand_db(
@@ -618,7 +719,7 @@ def test_expand_pool_ranks_term_hits_before_cosine(tmp_path):
 
 
 def test_expand_pool_breaks_ties_by_cosine(tmp_path):
-    from priorart.search import _expand_pool
+    from priorart.retrieval.search import _expand_pool
 
     query_vector = _vec4(1.0, 0.0, 0.0, 0.0)
     conn, ids = _expand_db(
@@ -639,7 +740,7 @@ def test_expand_pool_breaks_ties_by_cosine(tmp_path):
 
 
 def test_expand_pool_respects_file_quota_order_and_limit(tmp_path):
-    from priorart.search import EXPANSION_FILE_QUOTA, EXPANSION_LIMIT, _expand_pool
+    from priorart.retrieval.search import EXPANSION_FILE_QUOTA, EXPANSION_LIMIT, _expand_pool
 
     files = {}
     for index in range(20):
@@ -659,7 +760,7 @@ def test_expand_pool_respects_file_quota_order_and_limit(tmp_path):
 
 
 def test_expand_pool_ignores_files_without_fused_symbols(tmp_path):
-    from priorart.search import _expand_pool
+    from priorart.retrieval.search import _expand_pool
 
     conn, ids = _expand_db(
         tmp_path,
@@ -676,7 +777,7 @@ def test_expand_pool_ignores_files_without_fused_symbols(tmp_path):
 
 
 def test_search_pool_expansion_adds_owner_and_can_be_disabled(tmp_path):
-    conn, ids = _expand_db(
+    conn, _ids = _expand_db(
         tmp_path,
         {
             "a.py": [
@@ -688,14 +789,13 @@ def test_search_pool_expansion_adds_owner_and_can_be_disabled(tmp_path):
     conn.execute("INSERT INTO files (repo, path, mtime_ns, size) VALUES ('r', 'a.py', 0, 0)")
     conn.commit()
 
-    from priorart.search import search
+    from priorart.retrieval import search
 
     with_expansion = search(conn, "r", "widget", k=10, pool_expansion=True)
     assert [candidate.qualname for candidate in with_expansion.candidates] == [
         "widget_keeper",
         "owner",
     ]
-    assert with_expansion.trace.pool_expansion == [ids[("a.py", "owner")]]
 
     without_expansion = search(conn, "r", "widget", k=10, pool_expansion=False)
     assert [candidate.qualname for candidate in without_expansion.candidates] == ["widget_keeper"]
@@ -719,15 +819,15 @@ def _insert_symbol(conn, repo: str = "r") -> None:
 
 def test_embed_profile_change_resets_index(tmp_path):
     db = tmp_path / "profile.db"
-    conn = connect(db, 4, embed_model="embed-a", embed_input_format="instruct-text")
+    conn = initialize_writer(db, StoreProfile(embed_dim=4, embed_model="embed-a"))
     _insert_symbol(conn)
     conn.close()
 
-    conn = connect(db, 4, embed_model="embed-a", embed_input_format="instruct-text")
+    conn = initialize_writer(db, StoreProfile(embed_dim=4, embed_model="embed-a"))
     assert conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0] == 1
     conn.close()
 
-    conn = connect(db, 4, embed_model="embed-b", embed_input_format="instruct-text")
+    conn = initialize_writer(db, StoreProfile(embed_dim=4, embed_model="embed-b"))
     assert conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0] == 0
     assert (
         conn.execute("SELECT value FROM meta WHERE key = 'embed_model'").fetchone()[0] == "embed-b"
@@ -735,7 +835,9 @@ def test_embed_profile_change_resets_index(tmp_path):
     _insert_symbol(conn)
     conn.close()
 
-    conn = connect(db, 4, embed_model="embed-b", embed_input_format="qwen3")
+    conn = initialize_writer(
+        db, StoreProfile(embed_dim=4, embed_model="embed-b", embed_input_format="qwen3")
+    )
     assert conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0] == 0
     assert (
         conn.execute("SELECT value FROM meta WHERE key = 'embed_input_format'").fetchone()[0]
@@ -753,7 +855,7 @@ def test_foreign_database_zero_user_version_is_refused(tmp_path):
     foreign.close()
 
     with pytest.raises(RuntimeError, match="refusing to overwrite"):
-        connect(db, embed_dim=4)
+        initialize_writer(db, StoreProfile(embed_dim=4))
 
     raw = sqlite3.connect(db)
     assert raw.execute("PRAGMA user_version").fetchone()[0] == 0

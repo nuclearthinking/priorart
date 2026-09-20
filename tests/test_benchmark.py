@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from priorart.search import Candidate, SearchReport, SearchTrace
+from priorart.retrieval import Candidate, SearchReport, SearchTrace
 
 
 def _benchmark_module():
@@ -58,7 +58,7 @@ def test_benchmark_scores_exact_symbol_identity():
 
 
 def _trace(*, fts=(99,), vec=(99,), fused=(99,), pool_expansion=()):
-    from priorart.search import SearchTrace
+    from priorart.retrieval import SearchTrace
 
     return SearchTrace(
         queries=["q"],
@@ -129,6 +129,7 @@ def _pool_candidate(path: str, qualname: str):
         full_signature=f"def {qualname}():",
         docstring="",
         body=f"def {qualname}(): pass",
+        source_role="production",
         score=0.5,
     )
 
@@ -317,7 +318,7 @@ def test_replay_documents_match_format_specs():
 
 
 def test_bounded_body_truncates_on_line_boundary():
-    from priorart.indexer import bounded_body
+    from priorart.core.text import bounded_body
 
     body = "\n".join(f"line {index}" for index in range(100))
 
@@ -340,7 +341,7 @@ def test_bounded_body_truncates_on_line_boundary():
 
 def test_replay_body_format_matches_search_rerank_document():
     benchmark = _benchmark_module()
-    from priorart.search import Candidate, rerank_document
+    from priorart.retrieval import Candidate, rerank_document
 
     candidate = Candidate(
         path="src/example.py",
@@ -354,6 +355,7 @@ def test_replay_body_format_matches_search_rerank_document():
         full_signature="def run(self, force: bool):",
         docstring="Run the example.",
         body="def run(self, force: bool):\n    return force",
+        source_role="production",
         score=0.1,
     )
     saved = {
@@ -365,7 +367,7 @@ def test_replay_body_format_matches_search_rerank_document():
         "body": "def run(self, force: bool):\n    return force",
     }
 
-    from priorart.search import BODY_MAX_CHARS
+    from priorart.retrieval.search import BODY_MAX_CHARS
 
     builder = benchmark._document_builder(
         "path-qualname-kind-signature-docstring-body-v1", BODY_MAX_CHARS

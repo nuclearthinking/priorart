@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 import re
 
-from .config import Config
+from priorart.core import Config
+
 from .httputil import REQUEST_ERRORS, post_json
 
 RERANK_INSTRUCTION = (

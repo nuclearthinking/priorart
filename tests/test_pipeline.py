@@ -3,10 +3,12 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from priorart.config import Config
-from priorart.indexer import index_repo, parse_source
-from priorart.search import rrf, search
-from priorart.store import connect
+from priorart.core.config import Config
+from priorart.indexing.parser import parse_source
+from priorart.indexing.pipeline import index_repo
+from priorart.retrieval import rrf, search
+from priorart.storage import StoreProfile, initialize_writer
+from tests.helpers import init_repo
 
 SAMPLE = '''\
 def parse_diff_patch(raw: bytes) -> list[str]:
@@ -20,6 +22,10 @@ class DiffViewer:
     def render(self, patch: str) -> str:
         return patch
 '''
+
+
+def _connect(tmp_path: Path):
+    return initialize_writer(tmp_path / "test.db", StoreProfile(embed_dim=8))
 
 
 def test_parse_source_extracts_symbols():
@@ -61,9 +67,9 @@ def test_full_signature_falls_back_for_bodyless_definitions():
 
 
 def test_full_signature_and_body_reach_rerank_documents(tmp_path):
-    (tmp_path / "sample.py").write_text(MULTILINE)
-    repo = tmp_path.resolve()
-    conn = connect(tmp_path / "test.db", embed_dim=8)
+    repo = init_repo(tmp_path)
+    (repo / "sample.py").write_text(MULTILINE)
+    conn = _connect(tmp_path)
     index_repo(conn, repo, embed_fn=None)
     captured = {}
 
@@ -90,13 +96,13 @@ def test_full_signature_and_body_reach_rerank_documents(tmp_path):
 
 
 def test_candidate_limit_controls_fused_pool_size(tmp_path):
+    repo = init_repo(tmp_path)
     files = {
         f"mod_{index}.py": f"def handler_{index}():\n    return {index}\n" for index in range(8)
     }
     for name, text in files.items():
-        (tmp_path / name).write_text(text)
-    repo = tmp_path.resolve()
-    conn = connect(tmp_path / "test.db", embed_dim=8)
+        (repo / name).write_text(text)
+    conn = _connect(tmp_path)
     index_repo(conn, repo, embed_fn=None)
     calls = []
 
@@ -111,9 +117,9 @@ def test_candidate_limit_controls_fused_pool_size(tmp_path):
 
 
 def test_pool_is_independent_of_output_k(tmp_path):
-    (tmp_path / "sample.py").write_text(SAMPLE)
-    repo = tmp_path.resolve()
-    conn = connect(tmp_path / "test.db", embed_dim=8)
+    repo = init_repo(tmp_path)
+    (repo / "sample.py").write_text(SAMPLE)
+    conn = _connect(tmp_path)
     index_repo(conn, repo, embed_fn=None)
     calls = []
 
@@ -133,9 +139,9 @@ def test_pool_is_independent_of_output_k(tmp_path):
 
 
 def test_index_and_lexical_search(tmp_path):
-    (tmp_path / "sample.py").write_text(SAMPLE)
-    repo = tmp_path.resolve()
-    conn = connect(tmp_path / "test.db", embed_dim=8)
+    repo = init_repo(tmp_path)
+    (repo / "sample.py").write_text(SAMPLE)
+    conn = _connect(tmp_path)
     stats = index_repo(conn, repo, embed_fn=None)
     assert stats["symbols"] == 3
     report = search(conn, str(repo), "split unified diff into patches", k=5)
@@ -165,7 +171,7 @@ def test_config_supports_shared_provider_with_service_overrides(monkeypatch, tmp
     monkeypatch.setenv("PRIORART_EMBED_BASE_URL", "http://127.0.0.1:8091/v1")
     monkeypatch.setenv("PRIORART_EMBED_API_KEY", "local-key")
     monkeypatch.setenv("PRIORART_LLM_MODEL", "query-expander")
-    monkeypatch.setenv("PRIORART_DB", str(tmp_path / "index.db"))
+    monkeypatch.setenv("PRIORART_INDEX_DIR", str(tmp_path / "indexes"))
 
     config = Config(_env_file=None)
 
@@ -176,7 +182,7 @@ def test_config_supports_shared_provider_with_service_overrides(monkeypatch, tmp
     assert config.rerank_base_url == "https://provider.example/v1"
     assert config.rerank_api_key == "shared-key"
     assert config.llm_model == "query-expander"
-    assert config.db_path == tmp_path / "index.db"
+    assert config.index_dir == tmp_path / "indexes"
 
 
 def test_config_reads_env_file(tmp_path):
@@ -221,7 +227,7 @@ def test_config_rejects_nonpositive_embed_dim(monkeypatch):
         Config(_env_file=None)
 
 
-def test_config_expands_db_path(monkeypatch):
-    monkeypatch.setenv("PRIORART_DB", "~/.priorart/x/index.db")
+def test_config_expands_index_dir(monkeypatch):
+    monkeypatch.setenv("PRIORART_INDEX_DIR", "~/.priorart/x/indexes")
 
-    assert Config(_env_file=None).db_path == Path.home() / ".priorart" / "x" / "index.db"
+    assert Config(_env_file=None).index_dir == Path.home() / ".priorart" / "x" / "indexes"
