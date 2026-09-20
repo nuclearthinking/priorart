@@ -18,7 +18,12 @@ class Runtime:
     def __init__(self, repo: Path, config: Config | None = None):
         self.config = config or Config()
         self.repo = Path(repo).resolve()
-        self.conn = connect(self.config.db_path, self.config.embed_dim)
+        self.conn = connect(
+            self.config.db_path,
+            self.config.embed_dim,
+            embed_model=self.config.embed_model,
+            embed_input_format=self.config.embed_input_format,
+        )
         self.embed = embed_mod.make_embedder(self.config)
         self.expand = expand_mod.make_expander(self.config)
         self.rerank = rerank_mod.make_reranker(self.config)
@@ -35,6 +40,7 @@ class Runtime:
                 embed_fn=self.embed,
                 rerank_fn=self.rerank,
                 pool_expansion=self.config.pool_expansion,
+                candidate_limit=self.config.candidate_limit,
             )
 
     def reindex(self, *, rebuild: bool = False) -> dict:

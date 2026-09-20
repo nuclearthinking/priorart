@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from priorart.search import Candidate, SearchReport, SearchTrace
+
 
 def _benchmark_module():
     path = Path(__file__).parents[1] / "benchmarks" / "run.py"
@@ -112,6 +114,63 @@ def test_priorart_revision_records_sha_and_dirty_flag():
 
     assert len(revision["sha"]) == 40
     assert isinstance(revision["dirty"], bool)
+
+
+def _pool_candidate(path: str, qualname: str):
+    return Candidate(
+        path=path,
+        name=qualname,
+        qualname=qualname,
+        kind="function",
+        lang="python",
+        line=1,
+        end_line=2,
+        signature=f"def {qualname}():",
+        full_signature=f"def {qualname}():",
+        docstring="",
+        body=f"def {qualname}(): pass",
+        score=0.5,
+    )
+
+
+def test_run_case_saves_pool_and_ranks_over_full_pool():
+    benchmark = _benchmark_module()
+    pool = [_pool_candidate("a.py", "walk"), _pool_candidate("a.py", "run")]
+    trace = SearchTrace(
+        queries=["find the runner"],
+        stage_seconds={},
+        fts_rankings=[[1, 2]],
+        vec_rankings=[],
+        fused=[(1, 0.5), (2, 0.25)],
+        rerank_order=None,
+        pool_expansion=[],
+    )
+
+    class FakeRuntime:
+        def search(self, query: str, k: int = 10):
+            return SearchReport(
+                candidates=pool[:k],
+                warnings=[],
+                symbol_count=2,
+                head="abc",
+                age_seconds=1.0,
+                trace=trace,
+                pool=pool,
+            )
+
+    case = {
+        "id": "acme-1",
+        "query": "find the runner",
+        "expected": {"path": "a.py", "qualname": "run"},
+    }
+
+    full = benchmark._run_case(FakeRuntime(), case, gold_id=2, k=10, save_depth=None)
+    truncated = benchmark._run_case(FakeRuntime(), case, gold_id=2, k=10, save_depth=1)
+
+    assert full["rank"] == 2
+    assert [result["qualname"] for result in full["results"]] == ["walk", "run"]
+    assert truncated["rank"] == 2
+    assert [result["qualname"] for result in truncated["results"]] == ["walk"]
 
 
 def test_priorart_revision_fails_loudly_without_git(monkeypatch):
@@ -258,29 +317,30 @@ def test_replay_documents_match_format_specs():
 
 
 def test_bounded_body_truncates_on_line_boundary():
-    benchmark = _benchmark_module()
+    from priorart.indexer import bounded_body
+
     body = "\n".join(f"line {index}" for index in range(100))
 
-    short = benchmark.bounded_body(body, 10_000)
+    short = bounded_body(body, 10_000)
     assert short == body
 
-    truncated = benchmark.bounded_body(body, 60)
+    truncated = bounded_body(body, 60)
     kept, marker = truncated.rsplit("\n", 1)
     assert len(truncated) < 80
     assert marker.startswith("… (+")
     assert marker.endswith(" lines)")
     assert kept.splitlines()[-1] == "line 7"
 
-    single_line = benchmark.bounded_body("x" * 500, 60)
+    single_line = bounded_body("x" * 500, 60)
     assert single_line == "x" * 60 + "\n…"
 
-    assert benchmark.bounded_body("def f():\n    return 1", 0) == ""
-    assert benchmark.bounded_body("def f():\n    return 1", -5) == ""
+    assert bounded_body("def f():\n    return 1", 0) == ""
+    assert bounded_body("def f():\n    return 1", -5) == ""
 
 
 def test_replay_body_format_matches_search_rerank_document():
     benchmark = _benchmark_module()
-    from priorart.search import Candidate, _rerank_document
+    from priorart.search import Candidate, rerank_document
 
     candidate = Candidate(
         path="src/example.py",
@@ -310,7 +370,7 @@ def test_replay_body_format_matches_search_rerank_document():
     builder = benchmark._document_builder(
         "path-qualname-kind-signature-docstring-body-v1", BODY_MAX_CHARS
     )
-    assert builder(saved) == _rerank_document(candidate)
+    assert builder(saved) == rerank_document(candidate, body_max_chars=BODY_MAX_CHARS)
 
 
 def test_replay_reorders_pool_and_keeps_source_order_on_invalid():
@@ -861,3 +921,20 @@ def test_publish_accepts_replaced_revision(tmp_path):
     data = json.loads(published.read_text())
     assert data["revision"] == "aaa111"
     assert data["provenance"] == {"redacted": True, "revision": "opaque-alias"}
+
+
+def test_replay_case_flags_source_order_fallback():
+    benchmark = _benchmark_module()
+    case = _source_artifact()["cases"][0]
+    build_document = benchmark._document_builder("signature-docstring-v1", 1200)
+
+    def failing_rerank(query, documents):
+        return None, "rerank failed (boom); kept hybrid order"
+
+    replayed = benchmark._replay_case(case, failing_rerank, build_document, k=10)
+    assert replayed["replay_fallback"] is True
+    assert replayed["warnings"] == ["rerank failed (boom); kept hybrid order"]
+    assert replayed["rank"] == 2  # source order preserved
+
+    ok = benchmark._replay_case(case, _reverse_rerank, build_document, k=10)
+    assert ok["replay_fallback"] is False

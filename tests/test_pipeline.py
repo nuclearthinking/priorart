@@ -89,6 +89,49 @@ def test_full_signature_and_body_reach_rerank_documents(tmp_path):
     )
 
 
+def test_candidate_limit_controls_fused_pool_size(tmp_path):
+    files = {
+        f"mod_{index}.py": f"def handler_{index}():\n    return {index}\n" for index in range(8)
+    }
+    for name, text in files.items():
+        (tmp_path / name).write_text(text)
+    repo = tmp_path.resolve()
+    conn = connect(tmp_path / "test.db", embed_dim=8)
+    index_repo(conn, repo, embed_fn=None)
+    calls = []
+
+    def rerank(query, documents):
+        calls.append(len(documents))
+        return None, None
+
+    search(conn, str(repo), "handler", k=5, rerank_fn=rerank, candidate_limit=3)
+    search(conn, str(repo), "handler", k=5, rerank_fn=rerank)
+
+    assert calls == [3, 8]
+
+
+def test_pool_is_independent_of_output_k(tmp_path):
+    (tmp_path / "sample.py").write_text(SAMPLE)
+    repo = tmp_path.resolve()
+    conn = connect(tmp_path / "test.db", embed_dim=8)
+    index_repo(conn, repo, embed_fn=None)
+    calls = []
+
+    def rerank(query, documents):
+        calls.append([document.splitlines()[0] for document in documents])
+        return None, None
+
+    first = search(conn, str(repo), "split unified diff into patches", k=2, rerank_fn=rerank)
+    second = search(conn, str(repo), "split unified diff into patches", k=10, rerank_fn=rerank)
+
+    assert calls[0] == calls[1]
+    assert len(first.pool) == len(second.pool) == 3
+    assert [candidate.qualname for candidate in first.candidates] == [
+        candidate.qualname for candidate in first.pool[:2]
+    ]
+    assert second.candidates == second.pool
+
+
 def test_index_and_lexical_search(tmp_path):
     (tmp_path / "sample.py").write_text(SAMPLE)
     repo = tmp_path.resolve()

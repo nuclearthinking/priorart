@@ -3,10 +3,8 @@ from __future__ import annotations
 import json
 import re
 
-import httpx
-
 from .config import Config
-from .httputil import post_json
+from .httputil import REQUEST_ERRORS, post_json
 
 EXPAND_PROMPT = (
     "You turn a developer's feature request into code search queries for one "
@@ -33,8 +31,10 @@ def make_expander(config: Config):
         try:
             payload = post_json(url, body, config.llm_api_key, timeout=60)
             content = payload["choices"][0]["message"]["content"]
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as err:
+        except REQUEST_ERRORS as err:
             return [query], f"query expansion failed ({err}); used raw query"
+        if not isinstance(content, str):
+            return [query], "query expansion returned no content; used raw query"
         queries = _parse_queries(content)
         if not queries:
             return [query], "query expansion returned unparseable output; used raw query"

@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import httpx
 
+# Single source for client catch-alls: a network or payload-shape failure must
+# degrade to a warning, never to an uncaught exception.
+REQUEST_ERRORS = (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError)
+
 
 def auth_headers(api_key: str | None) -> dict[str, str]:
     headers = {"content-type": "application/json"}

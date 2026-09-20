@@ -70,6 +70,31 @@ SKIP_DIRS = frozenset(
 
 MAX_FILE_BYTES = 1_000_000
 
+# Representation v2: symbol texts carry a bounded body excerpt so that dense
+# and lexical retrieval see behavior, not only names and docstrings.
+BODY_EXCERPT_CHARS = 800
+EMBED_TEXT_MAX_CHARS = 2200
+EMBED_TEXT_FORMAT = "kind-qualname-file-signature-docstring-body800-v2"
+SEARCH_TEXT_FORMAT = "qualname-path-signature-docstring-body800-v2"
+
+
+def bounded_body(body: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(body) <= max_chars:
+        return body
+    kept = body[:max_chars]
+    cut = kept.rfind("\n")
+    if cut > 0:
+        kept = kept[:cut]
+    skipped = len(body.splitlines()) - len(kept.splitlines())
+    if skipped > 0:
+        return f"{kept}\n… (+{skipped} lines)"
+    if len(kept) < len(body):
+        return f"{kept}\n…"
+    return kept
+
+
 _NAME_FALLBACKS = (
     "identifier",
     "field_identifier",
@@ -143,7 +168,7 @@ def preflight_parsers(langs) -> dict[str, str]:
 
 def repo_languages(root: Path) -> list[str]:
     root = Path(root)
-    return sorted({LANGS[Path(rel).suffix] for rel in _list_files(root)})
+    return sorted({LANGS[Path(rel).suffix] for rel in list_source_files(root)})
 
 
 def parse_source(data: bytes, lang: str, rel_path: str) -> ParseResult:
@@ -210,14 +235,21 @@ def _walk(  # noqa: PLR0913, PLR0917 - recursive tree walk context
             signature = text.split("\n", 1)[0][:200]
             full_signature = _signature_block(node, data) or signature
             body = "\n".join(lines[node.start_point.row : node.end_point.row + 1])
+            excerpt = bounded_body(body, BODY_EXCERPT_CHARS)
             search_text = "\n".join(
-                part for part in (qualname, rel_path, signature, docstring) if part
+                part for part in (qualname, rel_path, signature, docstring, excerpt) if part
             )
             embed_text = "\n".join(
                 part
-                for part in (f"{kind} {qualname}", f"file: {rel_path}", signature, docstring)
+                for part in (
+                    f"{kind} {qualname}",
+                    f"file: {rel_path}",
+                    signature,
+                    docstring,
+                    excerpt,
+                )
                 if part
-            )[:1500]
+            )[:EMBED_TEXT_MAX_CHARS]
             out.append(
                 Symbol(
                     path=rel_path,
@@ -285,7 +317,7 @@ def _docstring(node, data: bytes, lang: str) -> str:
     return ""
 
 
-def _git(root: Path, *args: str) -> str | None:
+def git_output(root: Path, *args: str) -> str | None:
     proc = subprocess.run(  # noqa: S603 - fixed git argv
         ["git", "-C", str(root), *args],  # noqa: S607 - partial path is fine
         capture_output=True,
@@ -297,7 +329,7 @@ def _git(root: Path, *args: str) -> str | None:
     return proc.stdout.strip() or None
 
 
-def _list_files(root: Path) -> list[str]:
+def list_source_files(root: Path) -> list[str]:
     proc = subprocess.run(  # noqa: S603 - fixed git argv
         ["git", "-C", str(root), "ls-files", "-z"],  # noqa: S607 - partial path is fine
         capture_output=True,
@@ -347,7 +379,7 @@ def _open_beneath(root: Path, rel: str) -> int:
     return opened
 
 
-def _capture_file(root: Path, rel: str) -> tuple[bytes, os.stat_result] | None:
+def capture_file(root: Path, rel: str) -> tuple[bytes, os.stat_result] | None:
     """Read file bytes and its stat together, from the same open file description."""
     try:
         fd = _open_beneath(root, rel)
@@ -370,8 +402,8 @@ def _capture_file(root: Path, rel: str) -> tuple[bytes, os.stat_result] | None:
 def index_repo(conn, root: Path, embed_fn=None, *, rebuild: bool = False) -> dict:
     root = Path(root).resolve()
     repo = str(root)
-    head = _git(root, "rev-parse", "HEAD")
-    rels = _list_files(root)
+    head = git_output(root, "rev-parse", "HEAD")
+    rels = list_source_files(root)
     current = set(rels)
     known = {
         path: (mtime_ns, size)
@@ -417,7 +449,7 @@ def index_repo(conn, root: Path, embed_fn=None, *, rebuild: bool = False) -> dic
 
 
 def _reindex_file(conn, repo: str, root: Path, rel: str, embed_fn) -> tuple[int, str | None]:
-    captured = _capture_file(root, rel)
+    captured = capture_file(root, rel)
     if captured is None:
         _record_parse_state(conn, repo, rel, "unreadable", None)
         return 0, f"{rel}: unreadable or changed while reading; not indexed, will retry"

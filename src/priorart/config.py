@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .search import CANDIDATE_LIMIT
 
 HOME_ENV_FILE = Path.home() / ".priorart" / "priorart.env"
 
@@ -41,11 +44,42 @@ class Config(BaseSettings):
         gt=0,
         description="Embedding vector dimension; must match the embedding model output",
     )
+    embed_input_format: Literal["instruct-text", "qwen3"] = Field(
+        default="instruct-text",
+        description=(
+            "Embedding input contract: 'instruct-text' wraps queries and documents in "
+            "Instruct/Text tags, 'qwen3' follows the official Qwen3-Embedding usage "
+            "(Instruct/Query prefix on queries only, raw documents, L2-normalized vectors)"
+        ),
+    )
     rerank_model: str = Field(default="", description="Reranker model id sent to the provider")
+    rerank_protocol: Literal["openai", "llama-completion"] = Field(
+        default="openai",
+        description=(
+            "Rerank client protocol: 'openai' posts to the /v1/rerank endpoint, "
+            "'llama-completion' scores documents one by one through a llama-server "
+            "/completion call and reads P(yes) from the first generated token's "
+            "logprobs (Qwen3-Reranker judge template)"
+        ),
+    )
+    rerank_query_format: Literal["instruct", "raw"] = Field(
+        default="instruct",
+        description=(
+            "Rerank query contract: 'instruct' wraps the query in manual "
+            "<Instruct>/<Query> tags, 'raw' passes the query unchanged for endpoints "
+            "whose template already formats it (llama-server /v1/rerank)"
+        ),
+    )
     llm_model: str = Field(default="", description="LLM model id sent to the provider")
     pool_expansion: bool = Field(
         default=True,
         description="Add suitable owner symbols from files the fused ranking found to the rerank pool",
+    )
+    candidate_limit: int = Field(
+        default=CANDIDATE_LIMIT,
+        ge=1,
+        le=500,
+        description="How many fused (FTS + dense, RRF) symbols enter the rerank pool",
     )
     db_path: Path = Field(
         default=Path.home() / ".priorart" / "index.db",

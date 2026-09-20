@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .indexer import _git, _list_files
+from .indexer import bounded_body, git_output, list_source_files
 
 CANDIDATE_LIMIT = 50
 RRF_K = 60
@@ -73,6 +73,7 @@ class SearchReport:
     current_head: str | None = None
     trace: SearchTrace | None = None
     parse_coverage: dict[str, int] | None = None
+    pool: list[Candidate] | None = None
 
 
 def rrf(rankings: list[list[int]], k: int = RRF_K) -> dict[int, float]:
@@ -114,7 +115,17 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
     rerank_fn=None,
     *,
     pool_expansion: bool = True,
+    candidate_limit: int | None = None,
 ) -> SearchReport:
+    """Run the retrieval pipeline; ``k`` only truncates the returned candidates.
+
+    The rerank pool is independent of ``k``: fused retrieval always takes
+    ``candidate_limit`` symbols (CANDIDATE_LIMIT by default) plus up to
+    EXPANSION_LIMIT pool-expansion owners, so the same profile does the same
+    model work for any output depth. The untruncated reranked pool is
+    available as ``report.pool``.
+    """
+    limit = CANDIDATE_LIMIT if candidate_limit is None else candidate_limit
     warnings: list[str] = []
     stage_seconds: dict[str, float] = {}
     started = time.perf_counter()
@@ -124,8 +135,14 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
     query_vectors = _embed_queries(queries, embed_fn, warnings)
     stage_seconds["embed"] = time.perf_counter() - started
     started = time.perf_counter()
-    retrieval = _retrieve(conn, repo, query, queries, query_vectors, k, pool_expansion)
+    retrieval = _retrieve(conn, repo, query, queries, query_vectors, pool_expansion, limit)
     stage_seconds["retrieve"] = time.perf_counter() - started
+    if query_vectors and retrieval.symbol_count and not retrieval.vectorized_count:
+        warnings.append(
+            "dense channel is empty: indexed symbols have no vectors "
+            "(index built without embeddings or with a different embedding "
+            "profile); rerun priorart index with embeddings configured"
+        )
     pool: list[tuple[int, Candidate]] = []
     for symbol_id, score in retrieval.top:
         row = retrieval.rows.get(symbol_id)
@@ -143,7 +160,7 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
     rerank_order = (
         [pool[index][0] for index in rerank_indices] if rerank_indices is not None else None
     )
-    current_head = _git(Path(repo), "rev-parse", "HEAD")
+    current_head = git_output(Path(repo), "rev-parse", "HEAD")
     return SearchReport(
         candidates=candidates[:k],
         warnings=warnings,
@@ -162,6 +179,7 @@ def search(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-st
             pool_expansion=[symbol_id for symbol_id, _ in retrieval.expansion],
         ),
         parse_coverage=retrieval.parse_coverage,
+        pool=candidates,
     )
 
 
@@ -177,22 +195,21 @@ class _Retrieval:
     head: str | None
     indexed_at: float | None
     symbol_count: int
+    vectorized_count: int
     parse_coverage: dict[str, int]
 
 
 def _retrieve(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per-stage collaborators
-    conn, repo, query, queries, query_vectors, k, pool_expansion
+    conn, repo, query, queries, query_vectors, pool_expansion, limit
 ) -> _Retrieval:
     if conn.in_transaction:
         conn.rollback()
     conn.execute("BEGIN")
     try:
-        fts_rankings = [fts_search(conn, repo, q) for q in queries]
-        vec_rankings = [vec_search(conn, repo, vector) for vector in query_vectors]
+        fts_rankings = [fts_search(conn, repo, q, limit) for q in queries]
+        vec_rankings = [vec_search(conn, repo, vector, limit) for vector in query_vectors]
         scores = rrf([*fts_rankings, *vec_rankings])
-        top = sorted(scores.items(), key=lambda item: item[1], reverse=True)[
-            : max(CANDIDATE_LIMIT, k)
-        ]
+        top = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:limit]
         rows = _fetch(conn, [symbol_id for symbol_id, _ in top], repo)
         expansion = (
             _expand_pool(conn, repo, query, query_vectors[0] if query_vectors else None, top)
@@ -202,6 +219,9 @@ def _retrieve(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per
         head, indexed_at = _repo_meta(conn, repo)
         symbol_count = conn.execute(
             "SELECT COUNT(*) FROM symbols WHERE repo = ?", (repo,)
+        ).fetchone()[0]
+        vectorized_count = conn.execute(
+            "SELECT COUNT(*) FROM symbols_vec WHERE repo = ?", (repo,)
         ).fetchone()[0]
         parse_coverage = dict(
             conn.execute(
@@ -222,6 +242,7 @@ def _retrieve(  # noqa: PLR0913, PLR0917 - retrieval pipeline takes explicit per
         head=head,
         indexed_at=indexed_at,
         symbol_count=symbol_count,
+        vectorized_count=vectorized_count,
         parse_coverage=parse_coverage,
     )
 
@@ -253,26 +274,14 @@ def _embed_queries(queries: list[str], embed_fn, warnings: list[str]) -> list[by
     return vectors
 
 
-def bounded_body(body: str, max_chars: int = BODY_MAX_CHARS) -> str:
-    if max_chars <= 0:
-        return ""
-    if len(body) <= max_chars:
-        return body
-    kept = body[:max_chars]
-    cut = kept.rfind("\n")
-    if cut > 0:
-        kept = kept[:cut]
-    skipped = len(body.splitlines()) - len(kept.splitlines())
-    if skipped > 0:
-        return f"{kept}\n… (+{skipped} lines)"
-    if len(kept) < len(body):
-        return f"{kept}\n…"
-    return kept
+def rerank_document(candidate: Candidate, *, body_max_chars: int = BODY_MAX_CHARS) -> str:
+    """Render one candidate as a reranker document.
 
-
-def _rerank_document(candidate: Candidate) -> str:
+    The single source of truth for the current ``RERANK_DOCUMENT_FORMAT``;
+    benchmarks replay this exact builder instead of keeping a copy.
+    """
     header = f"{candidate.path} :: {candidate.qualname} ({candidate.kind})"
-    body = bounded_body(candidate.body)
+    body = bounded_body(candidate.body, body_max_chars)
     return f"{header}\n{candidate.full_signature}\n{candidate.docstring}\n{body}"
 
 
@@ -417,13 +426,13 @@ def _cosine(embedding: bytes | None, query_vector: bytes | None) -> float:
 def _apply_rerank(candidates, query, rerank_fn, warnings) -> tuple[list, list[int] | None]:
     if rerank_fn is None or not candidates:
         return candidates, None
-    documents = [_rerank_document(candidate) for candidate in candidates]
+    documents = [rerank_document(candidate) for candidate in candidates]
     order, warning = rerank_fn(query, documents)
     if warning:
         warnings.append(warning)
-    if _valid_rerank(order, len(documents)):
+    ordered = rerank_positions(order, len(documents))
+    if ordered is not None:
         positions = dict(order)
-        ordered = sorted(positions, key=lambda idx: positions[idx], reverse=True)
         return [replace(candidates[idx], score=positions[idx]) for idx in ordered], ordered
     if order:
         warnings.append(
@@ -433,7 +442,19 @@ def _apply_rerank(candidates, query, rerank_fn, warnings) -> tuple[list, list[in
     return candidates, None
 
 
-def _valid_rerank(order, n: int) -> bool:
+def rerank_positions(order, n: int) -> list[int] | None:
+    """Validated descending-position view of a rerank order, or ``None``.
+
+    Shared by the live pipeline and benchmark replay so both apply rerank
+    results through the same validation and tie-break rules.
+    """
+    if not valid_rerank_order(order, n):
+        return None
+    positions = dict(order)
+    return sorted(positions, key=lambda idx: positions[idx], reverse=True)
+
+
+def valid_rerank_order(order, n: int) -> bool:
     if not isinstance(order, list) or len(order) != n:
         return False
     seen: set[int] = set()
@@ -491,8 +512,8 @@ def status_text(conn, repo: str, *, dense: bool = True) -> str:
             "SELECT status, COUNT(*) FROM parse_state WHERE repo = ? GROUP BY status", (repo,)
         ).fetchall()
     )
-    current_head = _git(root, "rev-parse", "HEAD")
-    dirty = _git(root, "status", "--porcelain") is not None
+    current_head = git_output(root, "rev-parse", "HEAD")
+    dirty = git_output(root, "status", "--porcelain") is not None
     reasons: list[str] = []
     if head is None and symbol_count == 0:
         reasons.append("not indexed")
@@ -545,7 +566,7 @@ def map_symbols_text(conn, repo: str, path_glob: str, limit: int = 200) -> str:
 
 
 def _file_drift(conn, repo: str, root: Path) -> tuple[int, int]:
-    expected = set(_list_files(root))
+    expected = set(list_source_files(root))
     known = {
         path: (mtime_ns, size)
         for path, mtime_ns, size in conn.execute(

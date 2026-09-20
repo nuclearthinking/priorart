@@ -48,9 +48,13 @@ Each stage can instead use a separate provider:
 | `PRIORART_EMBED_API_KEY` | shared API key | Embedding bearer token |
 | `PRIORART_EMBED_MODEL` | disabled | Embedding model |
 | `PRIORART_EMBED_DIM` | `1024` | Stored vector dimension |
+| `PRIORART_EMBED_INPUT_FORMAT` | `instruct-text` | Embedding input contract: `instruct-text` wraps queries and documents in `Instruct:`/`Text:` tags; `qwen3` follows the official Qwen3-Embedding usage (instruction prefix on queries only, raw documents, L2-normalized vectors) |
 | `PRIORART_RERANK_BASE_URL` | shared base URL | Rerank endpoint |
-| `PRIORART_RERANK_API_KEY` | shared API key | Rerank bearer token |
+| `PRIORART_RERANK_API_KEY` | shared API key | Reranking bearer token |
 | `PRIORART_RERANK_MODEL` | disabled | Reranking model |
+| `PRIORART_RERANK_PROTOCOL` | `openai` | Rerank client protocol: `openai` posts to the `/v1/rerank` endpoint; `llama-completion` scores each document through a llama-server `/completion` call and reads P(yes) from the first generated token's logprobs (Qwen3-Reranker judge template) |
+| `PRIORART_RERANK_QUERY_FORMAT` | `instruct` | Rerank query contract for the `openai` protocol: `instruct` wraps the query in manual `<Instruct>`/`<Query>` tags; `raw` passes the query unchanged to endpoints whose template formats it (llama-server `/v1/rerank`) |
+| `PRIORART_CANDIDATE_LIMIT` | `50` | Fused (FTS + dense, RRF) symbols entering the rerank pool |
 | `PRIORART_DB` | `~/.priorart/index.db` | SQLite index path |
 
 Service-specific settings override the shared provider. Keep real values in an
@@ -109,8 +113,12 @@ the referenced file before reuse. If no candidate fits, explain why.
   and reports vector coverage.
 - Embedding failures leave a file pending so a later refresh retries it.
 
-The vector dimension is part of the sqlite-vec schema. Use a separate database
-or remove the old database when changing `PRIORART_EMBED_DIM`.
+The embedding profile — model, vector dimension and input format — is recorded in
+the index metadata. Changing any of it (`PRIORART_EMBED_MODEL`,
+`PRIORART_EMBED_DIM`, `PRIORART_EMBED_INPUT_FORMAT`) resets the index and the
+next refresh re-embeds everything; keeping stale vectors would silently mix
+two incompatible vector spaces. The index database is a throwaway artifact
+rebuildable by re-indexing.
 
 ## Language coverage
 

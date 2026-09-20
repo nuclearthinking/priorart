@@ -18,8 +18,10 @@ from pathlib import Path, PurePosixPath
 from priorart.config import Config
 from priorart.expand import EXPAND_PROMPT
 from priorart.indexer import (
+    EMBED_TEXT_FORMAT,
     LANGS,
-    _capture_file,
+    SEARCH_TEXT_FORMAT,
+    capture_file,
     parse_source,
     preflight_parsers,
     repo_languages,
@@ -28,13 +30,13 @@ from priorart.rerank import make_reranker
 from priorart.runtime import Runtime
 from priorart.search import (
     BODY_MAX_CHARS,
-    CANDIDATE_LIMIT,
     EXPANSION_FILE_QUOTA,
     EXPANSION_LIMIT,
     RERANK_DOCUMENT_FORMAT,
     RRF_K,
-    _valid_rerank,
-    bounded_body,
+    Candidate,
+    rerank_document,
+    rerank_positions,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,10 +54,26 @@ def _document_locator_signature_docstring(candidate: dict) -> str:
     return f"{header}\n{candidate['full_signature']}\n{candidate['docstring']}"
 
 
-def _document_locator_signature_docstring_body(candidate: dict, max_chars: int) -> str:
-    header = f"{candidate['path']} :: {candidate['qualname']} ({candidate['kind']})"
-    body = bounded_body(candidate["body"], max_chars)
-    return f"{header}\n{candidate['full_signature']}\n{candidate['docstring']}\n{body}"
+def _document_current_format(candidate: dict, max_chars: int) -> str:
+    # The current format must stay byte-identical to the live pipeline: build
+    # the document through the same rerank_document() the search uses.
+    return rerank_document(
+        Candidate(
+            path=candidate["path"],
+            name="",
+            qualname=candidate["qualname"],
+            kind=candidate["kind"],
+            lang="",
+            line=candidate.get("line", 0),
+            end_line=0,
+            signature=candidate.get("signature", ""),
+            full_signature=candidate["full_signature"],
+            docstring=candidate.get("docstring", ""),
+            body=candidate.get("body", ""),
+            score=candidate.get("score", 0.0),
+        ),
+        body_max_chars=max_chars,
+    )
 
 
 DOCUMENT_FORMAT_IDS = (
@@ -67,7 +85,7 @@ DOCUMENT_FORMAT_IDS = (
 
 def _document_builder(format_id: str, body_max_chars: int):
     if format_id == RERANK_DOCUMENT_FORMAT:
-        return partial(_document_locator_signature_docstring_body, max_chars=body_max_chars)
+        return partial(_document_current_format, max_chars=body_max_chars)
     if format_id == LEGACY_LOCATOR_FORMAT:
         return _document_locator_signature_docstring
     if format_id == LEGACY_DOCUMENT_FORMAT:
@@ -216,17 +234,18 @@ def _require_benchmark_args(args) -> None:
         raise SystemExit("--body-from requires --replay")
 
 
-def _run_case(  # noqa: PLR0913, PLR0917 - one explicit argument per field of the case record
+def _run_case(
     runtime,
     case,
     gold_id,
-    depth,
     k,
     save_depth,
 ) -> dict:
     started = time.perf_counter()
-    report = runtime.search(case["query"], k=depth)
+    report = runtime.search(case["query"], k=k)
     latency = time.perf_counter() - started
+    # The pool is the untruncated rerank input, exactly what an MCP search with
+    # the same profile sees; k only limits what is reported to the caller.
     results = [
         {
             "path": candidate.path,
@@ -239,7 +258,7 @@ def _run_case(  # noqa: PLR0913, PLR0917 - one explicit argument per field of th
             "docstring": candidate.docstring,
             "body": candidate.body,
         }
-        for candidate in report.candidates
+        for candidate in report.pool or []
     ]
     rank = expected_rank(results, case["expected"])
     trace = report.trace
@@ -253,14 +272,14 @@ def _run_case(  # noqa: PLR0913, PLR0917 - one explicit argument per field of th
         "retrieved_by": retrieved_by(gold_id, trace),
         "latency_seconds": latency,
         "warnings": report.warnings,
-        "results": results[:save_depth],
+        "results": results if save_depth is None else results[:save_depth],
         "trace": asdict(trace),
     }
 
 
 def _run_benchmark(args) -> dict:
     _require_benchmark_args(args)
-    save_depth = args.save_depth if args.save_depth is not None else args.candidate_depth
+    save_depth = args.save_depth
     suite = json.loads(args.suite.read_text())
     if not suite.get("cases"):
         raise SystemExit("suite has no cases")
@@ -275,25 +294,25 @@ def _run_benchmark(args) -> dict:
 
     config = Config()
     if "PRIORART_DB" not in os.environ and "db_path" not in config.model_fields_set:
+        # The index DB is only valid for one embedding profile: model,
+        # dimension and input format together define the vector space, so all
+        # three belong in the key. Otherwise an A/B over embed_input_format
+        # would reuse vectors embedded with the other contract.
         model_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", config.embed_model or "lexical")
+        format_key = config.embed_input_format or "default"
         os.environ["PRIORART_DB"] = str(
-            ROOT / ".bench" / f"index-{model_key}-{config.embed_dim}.db"
+            ROOT / ".bench" / f"index-{model_key}-{config.embed_dim}-{format_key}.db"
         )
     if args.no_pool_expansion:
         os.environ["PRIORART_POOL_EXPANSION"] = "false"
 
     runtime = Runtime(repo)
-    # The rerank pool can hold fused plus expansion candidates; rank and
-    # path_rank must cover all of it, or an expansion rescue ranked below
-    # the requested depth would read as a fetch failure.
-    pool_depth = CANDIDATE_LIMIT + EXPANSION_LIMIT
-    depth = max(args.k, args.candidate_depth, pool_depth)
     index_started = time.perf_counter()
     index_stats = runtime.reindex(rebuild=args.rebuild)
     index_seconds = time.perf_counter() - index_started
     gold_ids = _verify_expected_symbols(runtime, suite["cases"])
     cases = [
-        _run_case(runtime, case, gold_ids[case["id"]], depth, args.k, save_depth)
+        _run_case(runtime, case, gold_ids[case["id"]], args.k, save_depth)
         for case in suite["cases"]
     ]
 
@@ -314,18 +333,21 @@ def _run_benchmark(args) -> dict:
         "manifest": {
             "representation": {
                 "rerank_document": RERANK_DOCUMENT_FORMAT,
-                "candidate_limit": CANDIDATE_LIMIT,
+                "embed_text": EMBED_TEXT_FORMAT,
+                "search_text": SEARCH_TEXT_FORMAT,
+                "candidate_limit": runtime.config.candidate_limit,
                 "rrf_k": RRF_K,
                 "pool_expansion": {
                     "enabled": runtime.config.pool_expansion,
                     "file_quota": EXPANSION_FILE_QUOTA,
                     "limit": EXPANSION_LIMIT,
                 },
+                "embedding_input_format": runtime.config.embed_input_format,
+                "rerank_query_format": runtime.config.rerank_query_format,
             },
             "expansion_prompt_sha256": hashlib.sha256(EXPAND_PROMPT.encode()).hexdigest(),
         },
         "k": args.k,
-        "candidate_depth": args.candidate_depth,
         "save_depth": save_depth,
         "index": index_stats,
         "coverage": _coverage(runtime),
@@ -355,13 +377,18 @@ def _run_replay(source: dict, rerank_fn, rerank_model: str, args) -> dict:
     representation = {"rerank_document": format_id}
     if format_id == RERANK_DOCUMENT_FORMAT:
         representation["body_max_chars"] = args.body_chars
+    # save_depth is None when the full pool was stored; report the actual size
+    # so the manifest describes the real replay input.
+    pool_size = source.get("save_depth") or max(
+        (len(case.get("results") or []) for case in cases_in), default=0
+    )
     manifest = {
         "representation": representation,
         "replay": {
             "source": args.replay.name,
             "source_label": source.get("label"),
             "source_created_at": source.get("created_at"),
-            "pool_size": source.get("save_depth"),
+            "pool_size": pool_size,
         },
     }
     if args.body_from is not None:
@@ -375,7 +402,6 @@ def _run_replay(source: dict, rerank_fn, rerank_model: str, args) -> dict:
         "models": {"reranker": rerank_model},
         "manifest": manifest,
         "k": args.k,
-        "candidate_depth": source.get("candidate_depth"),
         "save_depth": source.get("save_depth"),
         "summary": summarize(cases, args.k),
         "cases": cases,
@@ -415,7 +441,7 @@ def _parse_snapshot_file(
     path = PurePosixPath(rel)
     if not path.parts or path.is_absolute() or ".." in path.parts:
         raise SystemExit(f"cannot extract body: refusing path outside the snapshot: {rel}")
-    captured = _capture_file(repo, rel)
+    captured = capture_file(repo, rel)
     if captured is None:
         raise SystemExit(f"cannot extract body: unreadable or changed while reading: {rel}")
     data, _stat = captured
@@ -493,6 +519,10 @@ def _replay_case(case: dict, rerank_fn, build_document, k: int):
         if warning:
             warnings.append(warning)
     latency = time.perf_counter() - started
+    # Without a valid rerank order the reported rank keeps the source run's
+    # order — the source reranker's, not the hybrid one. Flag it so A/B
+    # consumers can see that the new reranker was not actually applied.
+    replay_fallback = bool(pool) and rerank_positions(order, len(pool)) is None
     ordered = _reordered(pool, order, warnings)
     rank = expected_rank(ordered, case["expected"])
     return {
@@ -503,6 +533,7 @@ def _replay_case(case: dict, rerank_fn, build_document, k: int):
         "rank": rank,
         "path_rank": path_rank(ordered, case["expected"]),
         "loss_stage": _replay_loss_stage(rank, k),
+        "replay_fallback": replay_fallback,
         "latency_seconds": latency,
         "warnings": warnings,
         "results": ordered,
@@ -510,9 +541,9 @@ def _replay_case(case: dict, rerank_fn, build_document, k: int):
 
 
 def _reordered(pool: list[dict], order, warnings: list[str]) -> list[dict]:
-    if _valid_rerank(order, len(pool)):
+    ordered = rerank_positions(order, len(pool))
+    if ordered is not None:
         positions = dict(order)
-        ordered = sorted(positions, key=lambda idx: positions[idx], reverse=True)
         return [{**pool[idx], "score": positions[idx]} for idx in ordered]
     if order:
         warnings.append(
@@ -573,12 +604,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--label")
     parser.add_argument("--output", type=Path)
     parser.add_argument("-k", type=int, default=10)
-    parser.add_argument("--candidate-depth", type=int, default=50)
     parser.add_argument(
         "--save-depth",
         type=int,
         default=None,
-        help="Candidates persisted per case (default: candidate depth)",
+        help="Candidates persisted per case (default: the full rerank pool)",
     )
     parser.add_argument("--rebuild", action="store_true")
     parser.add_argument(
@@ -616,18 +646,22 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _verify_snapshot(repo: Path, revision: str) -> None:
-    head = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    dirty = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except subprocess.CalledProcessError as err:
+        detail = (err.stderr or err.stdout or "").strip()
+        raise SystemExit(f"git failed on {repo}: {detail or err}") from err
     if head != revision:
         raise SystemExit(f"snapshot HEAD is {head}, expected {revision}")
     if dirty:

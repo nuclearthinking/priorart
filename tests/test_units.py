@@ -15,6 +15,7 @@ from priorart import expand as expand_mod
 from priorart import httputil, store
 from priorart.cli import app
 from priorart.config import Config
+from priorart.indexer import index_repo
 from priorart.runtime import Runtime
 from priorart.store import connect
 from tests.helpers import git, make_config
@@ -144,6 +145,69 @@ def test_embed_wrong_payload_length_returns_warning(monkeypatch):
     vectors, warning = embed(["a", "b"])
     assert vectors is None
     assert "wrong payload" in warning
+
+
+def test_embed_qwen3_format_instructs_queries_and_normalizes(monkeypatch):
+    config = make_config(
+        Path("/nonexistent"),
+        embed_base_url="http://embed.example/v1",
+        embed_model="embedder",
+        embed_input_format="qwen3",
+    )
+    embed = embed_mod.make_embedder(config)
+    seen = {}
+
+    def fake_post_json(url, body, api_key, timeout):
+        seen["input"] = body["input"]
+        return {"data": [{"embedding": [3.0, 4.0, 0.0, 0.0]} for _ in body["input"]]}
+
+    monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
+    vectors, warning = embed(["raw document text"], query=True)
+    assert warning is None
+    assert seen["input"] == [f"Instruct: {embed_mod.QUERY_INSTRUCTION}\nQuery: raw document text"]
+    vector = struct.unpack("<f", vectors[0][0:4])[0]
+    assert vector == pytest.approx(3.0 / 5.0)
+
+    vectors, warning = embed(["raw document text"], query=False)
+    assert warning is None
+    assert seen["input"] == ["raw document text"]
+    assert struct.unpack("<f", vectors[0][0:4])[0] == pytest.approx(3.0 / 5.0)
+
+
+def test_embed_legacy_format_wraps_documents(monkeypatch):
+    config = make_config(
+        Path("/nonexistent"),
+        embed_base_url="http://embed.example/v1",
+        embed_model="embedder",
+    )
+    embed = embed_mod.make_embedder(config)
+    seen = {}
+
+    def fake_post_json(url, body, api_key, timeout):
+        seen["input"] = body["input"]
+        return {"data": [{"embedding": [3.0, 4.0, 0.0, 0.0]} for _ in body["input"]]}
+
+    monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
+    vectors, warning = embed(["symbol text"], query=False)
+    assert warning is None
+    assert seen["input"] == [f"Instruct: {embed_mod.DOCUMENT_INSTRUCTION}\nText: symbol text"]
+    assert struct.unpack("<f", vectors[0][0:4])[0] == pytest.approx(3.0)
+
+
+def test_embed_dimension_mismatch_returns_warning(monkeypatch):
+    config = make_config(
+        Path("/nonexistent"),
+        embed_base_url="http://embed.example/v1",
+        embed_model="embedder",
+        embed_input_format="qwen3",
+    )
+    embed = embed_mod.make_embedder(config)
+    monkeypatch.setattr(
+        embed_mod, "post_json", lambda *args, **kwargs: {"data": [{"embedding": [1.0, 2.0, 3.0]}]}
+    )
+    vectors, warning = embed(["a"])
+    assert vectors is None
+    assert "dimension 3, expected 4" in warning
 
 
 def test_make_expander_requires_config():
@@ -412,6 +476,21 @@ def test_embed_dim_change_resets_index(tmp_path):
     assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
 
 
+def test_schema_creates_repo_path_index(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    conn = connect(tmp_path / "db.sqlite", embed_dim=4)
+    index_repo(conn, repo)
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'symbols_repo_path'"
+    ).fetchone()
+    assert row is not None
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN SELECT id FROM symbols WHERE repo = ? AND path = ?", ("r", "p")
+    ).fetchall()
+    assert all("SCAN symbols" not in step[3] for step in plan)
+
+
 def test_connect_reopen_preserves_index_and_is_noop(tmp_path):
     db = tmp_path / "reopen.db"
     conn = connect(db, embed_dim=4)
@@ -626,3 +705,57 @@ def test_search_pool_expansion_adds_owner_and_can_be_disabled(tmp_path):
 def test_blank_pool_expansion_env_means_default():
 
     assert Config.model_validate({"pool_expansion": ""}).pool_expansion is True
+
+
+def _insert_symbol(conn, repo: str = "r") -> None:
+    conn.execute(
+        "INSERT INTO symbols (repo, path, name, qualname, kind, lang, line, end_line, "
+        "signature, full_signature, docstring, body, search_text, embed_text) "
+        "VALUES (?, 'a.py', 'n', 'q', 'function', 'python', 1, 1, '', '', '', '', '', '')",
+        (repo,),
+    )
+    conn.commit()
+
+
+def test_embed_profile_change_resets_index(tmp_path):
+    db = tmp_path / "profile.db"
+    conn = connect(db, 4, embed_model="embed-a", embed_input_format="instruct-text")
+    _insert_symbol(conn)
+    conn.close()
+
+    conn = connect(db, 4, embed_model="embed-a", embed_input_format="instruct-text")
+    assert conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0] == 1
+    conn.close()
+
+    conn = connect(db, 4, embed_model="embed-b", embed_input_format="instruct-text")
+    assert conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT value FROM meta WHERE key = 'embed_model'").fetchone()[0] == "embed-b"
+    )
+    _insert_symbol(conn)
+    conn.close()
+
+    conn = connect(db, 4, embed_model="embed-b", embed_input_format="qwen3")
+    assert conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT value FROM meta WHERE key = 'embed_input_format'").fetchone()[0]
+        == "qwen3"
+    )
+    conn.close()
+
+
+def test_foreign_database_zero_user_version_is_refused(tmp_path):
+    db = tmp_path / "foreign-zero.db"
+    foreign = sqlite3.connect(db)
+    foreign.execute("CREATE TABLE app_data (payload TEXT)")
+    foreign.execute("INSERT INTO app_data VALUES ('owned by another application')")
+    foreign.commit()
+    foreign.close()
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        connect(db, embed_dim=4)
+
+    raw = sqlite3.connect(db)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert raw.execute("SELECT COUNT(*) FROM app_data").fetchone()[0] == 1
+    raw.close()

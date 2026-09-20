@@ -8,11 +8,11 @@ import pytest
 from priorart.indexer import ParseResult, index_repo, parse_source
 from priorart.search import (
     _fetch,
-    _valid_rerank,
     format_report,
     fts_search,
     search,
     status_text,
+    valid_rerank_order,
 )
 from priorart.store import connect
 from tests.helpers import git, make_config
@@ -386,6 +386,11 @@ def test_partial_parse_indexes_symbols_with_warning(tmp_path, monkeypatch):
     assert stats["files"] == 0
 
 
+def _hybrid_order(conn, repo: Path) -> list[str]:
+    report = search(conn, str(repo), "sample.py", k=3)
+    return [candidate.qualname for candidate in report.candidates]
+
+
 def test_rerank_incomplete_order_keeps_hybrid_order(tmp_path):
     repo = _init_repo(tmp_path)
     (repo / "sample.py").write_text(SAMPLE)
@@ -400,11 +405,7 @@ def test_rerank_incomplete_order_keeps_hybrid_order(tmp_path):
         k=3,
         rerank_fn=lambda query, documents: ([(0, 9.0)], None),
     )
-    assert [c.qualname for c in report.candidates] == [
-        "DiffViewer",
-        "DiffViewer.render",
-        "parse_diff_patch",
-    ]
+    assert [c.qualname for c in report.candidates] == _hybrid_order(conn, repo)
     assert any("invalid or incomplete (1/3" in warning for warning in report.warnings)
 
 
@@ -422,11 +423,7 @@ def test_rerank_duplicate_index_keeps_hybrid_order(tmp_path):
         k=3,
         rerank_fn=lambda query, documents: ([(0, 5.0), (0, 6.0), (1, 1.0)], None),
     )
-    assert [c.qualname for c in report.candidates] == [
-        "DiffViewer",
-        "DiffViewer.render",
-        "parse_diff_patch",
-    ]
+    assert [c.qualname for c in report.candidates] == _hybrid_order(conn, repo)
     assert any("invalid or incomplete" in warning for warning in report.warnings)
 
 
@@ -436,22 +433,13 @@ def test_valid_rerank_reorders_candidates(tmp_path):
     git(repo, "add", "sample.py")
     git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
+    hybrid = _hybrid_order(conn, repo)
 
-    report = search(
-        conn,
-        str(repo),
-        "sample.py",
-        k=3,
-        rerank_fn=lambda query, documents: (
-            [(1, 0.9), (0, 0.5), (2, 0.1)],
-            None,
-        ),
-    )
-    assert [c.qualname for c in report.candidates] == [
-        "DiffViewer.render",
-        "DiffViewer",
-        "parse_diff_patch",
-    ]
+    def reverse_rerank(query, documents):
+        return [(index, float(index)) for index in range(len(documents))], None
+
+    report = search(conn, str(repo), "sample.py", k=3, rerank_fn=reverse_rerank)
+    assert [c.qualname for c in report.candidates] == list(reversed(hybrid))
 
 
 def test_fetch_is_scoped_to_repo(tmp_path):
@@ -560,12 +548,60 @@ def test_rerank_ignores_non_dict_and_bad_index_items(monkeypatch, tmp_path):
     assert warning == "rerank response had 3 malformed items"
 
 
+def test_rerank_raw_format_passes_query_unchanged(monkeypatch, tmp_path):
+    from priorart import rerank as rerank_mod
+
+    seen = {}
+
+    def fake_post_json(url, body, api_key, timeout):
+        seen["query"] = body["query"]
+        return {"results": [{"index": 0, "relevance_score": 0.9}]}
+
+    monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    config = make_config(
+        tmp_path,
+        rerank_base_url="http://rerank.example/v1",
+        rerank_model="reranker",
+        rerank_query_format="raw",
+        db_path=tmp_path / "rerank-raw-test.db",
+    )
+    rerank = rerank_mod.make_reranker(config)
+    order, warning = rerank("retry failed calls", ["doc0"])
+    assert order == [(0, 0.9)]
+    assert warning is None
+    assert seen["query"] == "retry failed calls"
+
+
+def test_rerank_instruct_format_wraps_query(monkeypatch, tmp_path):
+    from priorart import rerank as rerank_mod
+
+    seen = {}
+
+    def fake_post_json(url, body, api_key, timeout):
+        seen["query"] = body["query"]
+        return {"results": [{"index": 0, "relevance_score": 0.9}]}
+
+    monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    config = make_config(
+        tmp_path,
+        rerank_base_url="http://rerank.example/v1",
+        rerank_model="reranker",
+        db_path=tmp_path / "rerank-instruct-test.db",
+    )
+    rerank = rerank_mod.make_reranker(config)
+    order, warning = rerank("retry failed calls", ["doc0"])
+    assert order == [(0, 0.9)]
+    assert warning is None
+    assert seen["query"].startswith("<Instruct>: ")
+    assert seen["query"].endswith("\n<Query>: retry failed calls")
+
+
 def test_valid_rerank_rejects_bool_and_nonfinite_scores():
-    assert _valid_rerank([(0, 1.0), (1, 0.5)], 2) is True
-    assert _valid_rerank([(0, True), (1, False)], 2) is False
-    assert _valid_rerank([(0, float("nan")), (1, 0.5)], 2) is False
-    assert _valid_rerank([(0, float("inf")), (1, 0.5)], 2) is False
-    assert _valid_rerank([("0", 1.0), (1, 0.5)], 2) is False
+    assert valid_rerank_order([(0, 1.0), (1, 0.5)], 2) is True
+    assert valid_rerank_order([(0, True), (1, False)], 2) is False
+    assert valid_rerank_order([(0, float("nan")), (1, 0.5)], 2) is False
+    assert valid_rerank_order([(0, float("inf")), (1, 0.5)], 2) is False
+    assert valid_rerank_order([("0", 1.0), (1, 0.5)], 2) is False
 
 
 def test_search_dense_path_inside_read_transaction(tmp_path):
@@ -654,7 +690,7 @@ def test_unreadable_file_state_is_persisted(tmp_path, monkeypatch):
     git(repo, "commit", "-q", "-m", "init")
     conn, _ = _index(repo, tmp_path)
 
-    monkeypatch.setattr(indexer, "_capture_file", lambda root, rel: None)
+    monkeypatch.setattr(indexer, "capture_file", lambda root, rel: None)
     (repo / "sample.py").write_text("def changed(): pass\n")
 
     stats = index_repo(conn, repo)
@@ -806,3 +842,194 @@ def test_search_trace_records_rerank_fallback(tmp_path):
     assert [symbol_id for symbol_id, _score in trace.fused] == [
         qualname_to_id[c.qualname] for c in report.candidates
     ]
+
+
+def _completion_payload(logprobs):
+    top = [{"token": t, "logprob": lp} for t, lp in logprobs]
+    return {"completion_probabilities": [{"top_logprobs": top}]}
+
+
+def test_rerank_llama_completion_scores_from_yes_no_logprobs(monkeypatch, tmp_path):
+    from priorart import rerank as rerank_mod
+
+    seen = {"prompts": []}
+
+    def fake_post_json(url, body, api_key, timeout):
+        seen["url"] = url
+        seen["n_predict"] = body["n_predict"]
+        seen["prompts"].append(body["prompt"])
+        if body["prompt"].count("doc-one") > 0:
+            return _completion_payload([("yes", -0.2), ("Yes", -3.0), ("no", -4.0), ("true", -6.0)])
+        return _completion_payload([("no", -0.1), ("No", -3.0), ("yes", -5.0), ("false", -6.0)])
+
+    monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    config = make_config(
+        tmp_path,
+        rerank_base_url="http://rerank.example/v1",
+        rerank_model="priorart-rerank",
+        rerank_protocol="llama-completion",
+        db_path=tmp_path / "rerank-lc-test.db",
+    )
+    rerank = rerank_mod.make_reranker(config)
+    order, warning = rerank("retry failed calls", ["doc-one", "doc-two"])
+    assert warning is None
+    assert len(order) == 2
+    assert order[0][0] == 0
+    assert order[0][1] > 0.97
+    assert order[1][0] == 1
+    assert order[1][1] < 0.03
+    assert seen["url"] == "http://rerank.example/completion"
+    assert seen["n_predict"] == 1
+    prompts = seen["prompts"]
+    assert len(prompts) == 2
+    for prompt in prompts:
+        assert "retry failed calls" in prompt
+        assert "Judge whether the Document meets the requirements" in prompt
+        assert rerank_mod.RERANK_INSTRUCTION in prompt
+        assert prompt.endswith("\n\n")
+    assert "doc-one" in prompts[0]
+    assert "doc-two" in prompts[1]
+    assert prompt.startswith("<|im_start|>system")
+    assert "Judge whether the Document meets the requirements" in prompt
+    assert rerank_mod.RERANK_INSTRUCTION in prompt
+    assert prompt.endswith("\n\n")
+
+
+def test_rerank_llama_completion_missing_token_floors_score(monkeypatch, tmp_path):
+    from priorart import rerank as rerank_mod
+
+    def fake_post_json(url, body, api_key, timeout):
+        return _completion_payload([("yes", -0.3), ("Yes", -3.0), ("true", -4.0)])
+
+    monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    config = make_config(
+        tmp_path,
+        rerank_base_url="http://rerank.example",
+        rerank_model="priorart-rerank",
+        rerank_protocol="llama-completion",
+        db_path=tmp_path / "rerank-lc-floor-test.db",
+    )
+    rerank = rerank_mod.make_reranker(config)
+    order, warning = rerank("query", ["doc"])
+    assert warning is None
+    assert order[0][1] > 0.9
+
+
+def test_rerank_llama_completion_without_yes_no_keeps_hybrid_order(monkeypatch, tmp_path):
+    from priorart import rerank as rerank_mod
+
+    def fake_post_json(url, body, api_key, timeout):
+        return _completion_payload([("true", -0.3), ("false", -1.0)])
+
+    monkeypatch.setattr(rerank_mod, "post_json", fake_post_json)
+    config = make_config(
+        tmp_path,
+        rerank_base_url="http://rerank.example/v1",
+        rerank_model="priorart-rerank",
+        rerank_protocol="llama-completion",
+        db_path=tmp_path / "rerank-lc-miss-test.db",
+    )
+    rerank = rerank_mod.make_reranker(config)
+    order, warning = rerank("query", ["doc"])
+    assert order is None
+    assert warning == "rerank completion had no yes/no logprobs; kept hybrid order"
+
+
+def test_rerank_prompt_template_matches_official_qwen3_reranker_usage():
+    from priorart import rerank as rerank_mod
+
+    template = rerank_mod.RERANK_PROMPT_TEMPLATE
+    assert "<|im_start|>system\n" in template
+    assert '"yes" or "no"' in template
+    assert "<Instruct>: " + rerank_mod.RERANK_INSTRUCTION in template
+    assert "<Query>: {query}" in template
+    assert "<Document>: {document}" in template
+    assert "assistant\n" + chr(60) + "think" + chr(62) in template
+    assert chr(60) + "/think" + chr(62) in template
+
+
+def test_query_expansion_null_content_falls_back_to_raw_query(monkeypatch, tmp_path):
+    from priorart import expand as expand_mod
+
+    monkeypatch.setattr(
+        expand_mod,
+        "post_json",
+        lambda *args, **kwargs: {"choices": [{"message": {"content": None}}]},
+    )
+    config = make_config(
+        tmp_path,
+        llm_base_url="http://llm.example/v1",
+        llm_model="chat",
+        db_path=tmp_path / "expand-test.db",
+    )
+    expand = expand_mod.make_expander(config)
+    queries, warning = expand("find the handler")
+    assert queries == ["find the handler"]
+    assert "query expansion returned no content" in warning
+
+
+def test_embedding_payload_data_order_follows_index_field(monkeypatch, tmp_path):
+    from priorart import embed as embed_mod
+
+    def fake_post_json(url, body, api_key, timeout):
+        assert [item.rsplit("Text: ", 1)[1] for item in body["input"]] == ["text-a", "text-b"]
+        return {
+            "data": [
+                {"index": 1, "embedding": [0.2, 0.2, 0.2, 0.2]},
+                {"index": 0, "embedding": [0.1, 0.1, 0.1, 0.1]},
+            ]
+        }
+
+    monkeypatch.setattr(embed_mod, "post_json", fake_post_json)
+    config = make_config(
+        tmp_path,
+        embed_base_url="http://embed.example/v1",
+        embed_model="embedder",
+        db_path=tmp_path / "embed-test.db",
+    )
+    embed = embed_mod.make_embedder(config)
+    vectors, warning = embed(["text-a", "text-b"])
+    assert warning is None
+    import sqlite_vec
+
+    assert vectors == [
+        sqlite_vec.serialize_float32([0.1, 0.1, 0.1, 0.1]),
+        sqlite_vec.serialize_float32([0.2, 0.2, 0.2, 0.2]),
+    ]
+
+
+def test_rerank_prompt_substitution_is_single_pass():
+    from priorart.rerank import RERANK_PROMPT_TEMPLATE, _fill_template
+
+    prompt = _fill_template(RERANK_PROMPT_TEMPLATE, "weird {document} query", "<body>")
+    assert "weird {document} query" in prompt
+    assert "<body>" in prompt
+    assert prompt.count("{document}") == 1
+
+
+def test_rerank_missing_score_counts_as_malformed():
+    from priorart.rerank import _parse_results
+
+    order, warning = _parse_results([{"index": 0}, {"index": 1, "relevance_score": 0.4}])
+    assert order == [(1, 0.4)]
+    assert warning == "rerank response had 1 malformed items"
+
+
+def test_search_warns_when_dense_channel_is_empty(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "sample.py").write_text(SAMPLE)
+    git(repo, "add", "sample.py")
+    git(repo, "commit", "-q", "-m", "init")
+    conn, _stats = _index(repo, tmp_path)
+
+    def embed_fn(texts, *, query=False):
+        import sqlite_vec
+
+        return [sqlite_vec.serialize_float32([0.1, 0.2, 0.3, 0.4])] * len(texts), None
+
+    report = search(conn, str(repo), "parse diff patch", embed_fn=embed_fn)
+    assert any("dense channel is empty" in warning for warning in report.warnings)
+
+    _index(repo, tmp_path, embed_fn=embed_fn, rebuild=True)
+    report = search(conn, str(repo), "parse diff patch", embed_fn=embed_fn)
+    assert not any("dense channel is empty" in warning for warning in report.warnings)
