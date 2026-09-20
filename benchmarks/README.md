@@ -13,13 +13,15 @@ provenance are not suitable for publication.
 Evolution on the same frozen suite (`atlas-master-v1`, 20 real intent
 queries against an ~8k-symbol codebase). Each full run is an end-to-end
 evaluation: query expansion, lexical + dense retrieval, RRF fusion, rerank.
-All runs used the same remote model stack — `qwen3-embedding-8b`
-(4096-d), `qwen3-reranker-8b`, `glm-5.3` for query expansion — so the deltas
-below reflect pipeline changes, not model changes. Result files for runs 1–2
-were superseded and removed; run 3 reproduces their metrics with a
-self-contained candidate pool. "Index warnings" counts partial parses of the
-same two test files surfaced since run 2; run 5's artifact records them
-without query warnings.
+Runs 1–6 used the same remote model stack — `qwen3-embedding-8b`
+(4096-d), `qwen3-reranker-8b`, `glm-5.3` for query expansion — so their
+deltas reflect pipeline changes, not model changes. Runs 7–10 switch to a
+fully local stack (llama.cpp on Apple M5: `Qwen3-Embedding-0.6B` +
+`Qwen3-Reranker-4B` Q8_0, no LLM query expansion), trading latency for
+autonomy. Result files for runs 1–2 were superseded and removed; run 3
+reproduces their metrics with a self-contained candidate pool. "Index
+warnings" counts partial parses of the same two test files surfaced since
+run 2; run 5's artifact records them without query warnings.
 
 | Run | Date | Recall@10 | MRR@10 | p50 | p95 | Index warnings |
 |-----|------|----------:|-------:|----:|----:|----------------|
@@ -29,23 +31,27 @@ without query warnings.
 | 4 · locator rerank documents | 2026-09-19 | 0.80 | 0.593 | 4.0 s | 19.0 s | 2 partial-parse |
 | 5 · body rerank documents | 2026-09-19 | 0.85 | 0.806 | 6.7 s | 16.8 s | 2 partial-parse |
 | 6 · pool expansion (file → owner) | 2026-09-19 | **0.95** | 0.814 | 13.5 s | 19.5 s | 2 partial-parse |
+| 7 · local runtime — 0.6B rerank baseline | 2026-09-20 | 0.65 | 0.501 | 13.9 s | 15.9 s | 2 partial-parse |
+| 8 · local 0.6B, instruct-nested query, pool 100 | 2026-09-20 | 0.75 | 0.508 | 17.8 s | 22.0 s | 2 partial-parse |
+| 9 · local 4B reranker, completion-logprob scoring | 2026-09-20 | **0.90** | 0.715 | 41.3 s | 49.4 s | 2 partial-parse |
+| 10 · local 4B, candidate pool 150 | 2026-09-20 | **0.90** | **0.756** | 85.5 s | 98.9 s | 2 partial-parse |
 
 ```mermaid
 xychart-beta
     title "Retrieval quality by iteration (upper: Recall@10, lower: MRR@10)"
-    x-axis ["baseline", "hardened", "pool", "locator", "body", "expansion"]
+    x-axis ["baseline", "hardened", "pool", "locator", "body", "expansion", "local 0.6B", "local 0.6B instruct", "local 4B", "local 4B pool150"]
     y-axis "score" 0 --> 1
-    bar [0.70, 0.70, 0.70, 0.80, 0.85, 0.95]
-    bar [0.457, 0.458, 0.458, 0.593, 0.806, 0.814]
+    bar [0.70, 0.70, 0.70, 0.80, 0.85, 0.95, 0.65, 0.75, 0.90, 0.90]
+    bar [0.457, 0.458, 0.458, 0.593, 0.806, 0.814, 0.501, 0.508, 0.715, 0.756]
 ```
 
 ```mermaid
 xychart-beta
     title "Query latency by iteration (upper: p95, lower: p50, seconds)"
-    x-axis ["baseline", "hardened", "pool", "locator", "body", "expansion"]
-    y-axis "seconds" 0 --> 22
-    bar [8.9, 9.1, 3.7, 4.0, 6.7, 13.5]
-    bar [19.9, 17.3, 16.3, 19.0, 16.8, 19.5]
+    x-axis ["baseline", "hardened", "pool", "locator", "body", "expansion", "local 0.6B", "local 0.6B instruct", "local 4B", "local 4B pool150"]
+    y-axis "seconds" 0 --> 110
+    bar [8.9, 9.1, 3.7, 4.0, 6.7, 13.5, 13.9, 17.8, 41.3, 85.5]
+    bar [19.9, 17.3, 16.3, 19.0, 16.8, 19.5, 15.9, 22.0, 49.4, 98.9]
 ```
 
 **Iteration 1 — first full measurement.** The hybrid pipeline with remote
@@ -157,6 +163,32 @@ by product default (`PRIORART_POOL_EXPANSION=false` disables it;
 the added symbol ids. The `remote-qwen3-8b-body-control` and
 `remote-qwen3-8b-pool-expansion` artifacts were produced back to back on the
 same index and model stack.
+
+**Iterations 7–10 — fully local runtime.** The same suite end to end on a
+local stack: two resident llama-server processes (Qwen3-Embedding-0.6B,
+Qwen3-Reranker-4B Q8_0) on an Apple M5, LLM query expansion off. The 0.6B
+baseline (run 7) retraced the remote gap — 0.65/0.501 with five
+ranked-deep losses at full pool coverage — locating the bottleneck in
+reranker precision, not retrieval. The best 0.6B query format
+(instruction-nested, run 8, pool 100) recovered one case (0.75/0.508).
+The 4B reranker could not use `--rerank --pooling rank`: llama.cpp v0.4.1's
+embedding path diverges from the generational forward on this model
+(byte-identical prompts, different yes/no logits; the 0.6B is unaffected),
+so scoring moved client-side — the `llama-completion` protocol
+(`PRIORART_RERANK_PROTOCOL=llama-completion`) builds the official Qwen3
+judge prompt and reads P(yes)/(P(yes)+P(no)) from the first generated
+token's logprobs. Run 9 (pool 50): 0.90/0.715 — every ranked-deep loss of
+the 0.6B closed. Run 10 raised the fused pool to 150
+(`PRIORART_CANDIDATE_LIMIT`, decoupled from output k): 0.90/0.756 against
+the remote ceiling of 0.95/0.814; both remaining misses are
+retrieval-stage (one gold outside the pool at dense rank >150, one at
+rank 11), which no reranker can fix. Latency is the price of autonomy:
+p50 85.5 s at pool 150 — one sequential `/completion` per document;
+parallel scoring is the recorded next lever. Runs 9–10 used a fresh
+body-v2 index (same corpus revision and coverage as runs 1–6); the
+`local-qwen3-rerank4b-e1` and `local-qwen3-rerank4b-e1-pool150`
+artifacts, plus the two 0.6B runs, are published in
+[`results/`](results/).
 
 ## Suite format
 
