@@ -18,6 +18,7 @@ JOB_REPOSITORY_MISMATCH = "JOB_REPOSITORY_MISMATCH"
 WORKSPACE_SCOPE_MISMATCH = "WORKSPACE_SCOPE_MISMATCH"
 DAEMON_MISMATCH = "DAEMON_MISMATCH"
 DAEMON_PROFILE_MISMATCH = "DAEMON_PROFILE_MISMATCH"
+DAEMON_STOP_FAILED = "DAEMON_STOP_FAILED"
 HANDLE_CLOSED = "HANDLE_CLOSED"
 INVALID_ARGUMENT = "INVALID_ARGUMENT"
 
@@ -30,9 +31,16 @@ _NEXT_ACTIONS = {
     JOB_NOT_FOUND: "Check the job id, or call refresh_index to start a new job.",
     JOB_REPOSITORY_MISMATCH: "Repeat the call with the repo that owns the job.",
     WORKSPACE_SCOPE_MISMATCH: "Repeat the call with the repo fixed for this session.",
-    DAEMON_MISMATCH: "Restart the priorart daemon (priorart daemon) and retry.",
+    DAEMON_MISMATCH: (
+        "Restart the priorart daemon (priorart daemon restart) and retry; "
+        "if the daemon is already current, restart the MCP client session instead."
+    ),
     DAEMON_PROFILE_MISMATCH: (
         "Use the same config for this socket, choose another socket, or restart the daemon."
+    ),
+    DAEMON_STOP_FAILED: (
+        "Wait for the daemon to exit and run priorart daemon restart again; "
+        "if it keeps running, stop its process manually first."
     ),
     HANDLE_CLOSED: "Retry with a fresh handle (restart the session if daemon-backed).",
     INVALID_ARGUMENT: "Correct the argument and retry the call.",
@@ -45,6 +53,9 @@ _RENDERABLE_DETAILS = frozenset(
     {
         "accepted",
         "candidates",
+        "daemon_app_version",
+        "daemon_code_id",
+        "daemon_protocol",
         "field",
         "input",
         "job_id",

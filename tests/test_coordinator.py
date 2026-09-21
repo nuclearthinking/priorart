@@ -26,7 +26,7 @@ from priorart.coordinator import (
     _BrokenDaemonTransport,
     profile_fingerprint,
 )
-from priorart.core import Config
+from priorart.core import Config, code_identity
 from priorart.core.errors import DAEMON_MISMATCH, HANDLE_CLOSED, PriorartError
 from priorart.retrieval import format_status
 from priorart.storage.store import APP_VERSION
@@ -76,21 +76,26 @@ def test_handshake_refuses_protocol_mismatch(tmp_path):
         with pytest.raises(PriorartError) as err:
             client.call("handshake", protocol=999, app_version=APP_VERSION)
         assert err.value.code == DAEMON_MISMATCH
+        # the mismatch details report the daemon's own values, not the
+        # client's request (999 here) or its app version
+        assert err.value.payload()["daemon_protocol"] == PROTOCOL_VERSION
+        assert err.value.payload()["daemon_app_version"] == APP_VERSION
     finally:
         client.close()
         daemon.stop.set()
         daemon.thread.join(timeout=10)
 
 
-def test_handshake_refuses_app_version_mismatch(tmp_path):
+def test_handshake_refuses_code_identity_mismatch(tmp_path):
     daemon = DaemonFixture(tmp_path)
     daemon.thread.start()
     assert daemon.ready.wait(timeout=10)
     client = DaemonClient(daemon.socket, profile_fingerprint(daemon.config))
     try:
         with pytest.raises(PriorartError) as err:
-            client.call("handshake", protocol=PROTOCOL_VERSION, app_version="0.0.0-not-real")
+            client.call("handshake", protocol=PROTOCOL_VERSION, code_id="0" * 64)
         assert err.value.code == DAEMON_MISMATCH
+        assert "different priorart code" in err.value.message
     finally:
         client.close()
         daemon.stop.set()
@@ -172,6 +177,7 @@ def test_autostart_forwards_explicit_config_path(tmp_path, monkeypatch):
             "-m",
             "priorart",
             "daemon",
+            "start",
             "--socket",
             str(tmp_path / "missing.sock"),
             "--config",
@@ -370,9 +376,9 @@ def test_daemon_refuses_second_instance_on_same_socket(tmp_path):
             assert client.call(
                 "handshake",
                 protocol=PROTOCOL_VERSION,
-                app_version=APP_VERSION,
+                code_id=code_identity(),
                 profile=profile_fingerprint(first.config),
-            ) == {"app_version": APP_VERSION}
+            ) == {"app_version": APP_VERSION, "code_id": code_identity()}
         finally:
             client.close()
     finally:
@@ -643,3 +649,411 @@ def test_exhausted_handshake_retry_surfaces_the_public_error_type():
     assert err.value.code == DAEMON_MISMATCH
     assert not isinstance(err.value, _BrokenDaemonTransport)
     assert attempts == ["factory", "factory"]
+
+
+# --- stale daemon code (protocol 4 pins the loaded code identity) --------------
+
+
+def _stale_daemon(tmp_path, monkeypatch):
+    """Start a daemon whose serve-time code identity is not ours."""
+    import priorart.coordinator as coordinator_mod
+
+    monkeypatch.setattr(coordinator_mod, "code_identity", lambda: "stale-daemon-code")
+    daemon = DaemonFixture(tmp_path)
+    daemon.thread.start()
+    assert daemon.ready.wait(timeout=10)
+    monkeypatch.undo()
+    return daemon
+
+
+def test_stale_daemon_refuses_every_op_with_structured_error(tmp_path, monkeypatch):
+    daemon = _stale_daemon(tmp_path, monkeypatch)
+    try:
+        registry = RemoteRegistry(
+            lambda: DaemonClient(daemon.socket, profile_fingerprint(daemon.config))
+        )
+        for _attempt in (1, 2):  # per-op connections: every call is refused
+            with pytest.raises(PriorartError) as err:
+                registry.workspaces()
+            assert err.value.code == DAEMON_MISMATCH
+            assert "different priorart code" in err.value.message
+            assert "priorart daemon restart" in err.value.payload()["next_action"]
+            # the mismatch details report the daemon's own identity, so an
+            # agent can compare it against its running code
+            assert err.value.payload()["daemon_code_id"] == "stale-daemon-code"
+    finally:
+        daemon.stop.set()
+        daemon.thread.join(timeout=10)
+
+
+def test_mcp_boundary_returns_structured_mismatch_for_stale_daemon(tmp_path, monkeypatch):
+    from priorart import server as server_mod
+
+    daemon = _stale_daemon(tmp_path, monkeypatch)
+    same_socket = make_config(
+        tmp_path, daemon_socket=str(daemon.socket), index_dir=tmp_path / "indexes"
+    )
+    try:
+        mcp = server_mod.build_server(None, config=same_socket)
+        result = asyncio.run(mcp.call_tool("list_workspaces", {}))
+        assert result.is_error is True
+        assert result.structured_content["error"]["code"] == DAEMON_MISMATCH
+        assert "priorart daemon restart" in result.structured_content["error"]["next_action"]
+    finally:
+        daemon.stop.set()
+        daemon.thread.join(timeout=10)
+
+
+def test_daemon_survives_refusals_and_keeps_serving_matching_clients(tmp_path, monkeypatch):
+    import priorart.coordinator as coordinator_mod
+
+    daemon = _stale_daemon(tmp_path, monkeypatch)
+    try:
+        # a current-identity client is refused by the stale daemon...
+        with pytest.raises(PriorartError) as err:
+            DaemonClient(daemon.socket, profile_fingerprint(daemon.config))
+        assert err.value.code == DAEMON_MISMATCH
+        # ...a profile-mismatch client is refused...
+        with pytest.raises(PriorartError):
+            DaemonClient(daemon.socket, "not-the-daemon-profile")
+        # ...and the daemon still serves a client that matches it
+        monkeypatch.setattr(coordinator_mod, "code_identity", lambda: "stale-daemon-code")
+        client = DaemonClient(daemon.socket, profile_fingerprint(daemon.config))
+        try:
+            assert client.call("workspaces") == {"configured": [], "known_indexed": []}
+        finally:
+            client.close()
+    finally:
+        daemon.stop.set()
+        daemon.thread.join(timeout=10)
+
+
+def test_registry_recovers_after_daemon_replacement(tmp_path, monkeypatch):
+    daemon = _stale_daemon(tmp_path, monkeypatch)
+    registry = RemoteRegistry(
+        lambda: DaemonClient(daemon.socket, profile_fingerprint(daemon.config))
+    )
+    try:
+        with pytest.raises(PriorartError) as err:
+            registry.workspaces()
+        assert err.value.code == DAEMON_MISMATCH
+    finally:
+        daemon.stop.set()
+        daemon.thread.join(timeout=10)
+    replacement = DaemonFixture(tmp_path, socket=daemon.socket)
+    replacement.thread.start()
+    assert replacement.ready.wait(timeout=10)
+    try:
+        # the same registry object recovers: per-op connections re-handshake
+        assert registry.workspaces() == {"configured": [], "known_indexed": []}
+    finally:
+        registry.close()
+        replacement.stop.set()
+        replacement.thread.join(timeout=10)
+
+
+def test_singleton_lock_records_the_daemon_pid(tmp_path):
+    import os
+
+    daemon = DaemonFixture(tmp_path)
+    daemon.thread.start()
+    assert daemon.ready.wait(timeout=10)
+    try:
+        assert daemon.socket.with_suffix(".lock").read_text().strip() == str(os.getpid())
+    finally:
+        daemon.stop.set()
+        daemon.thread.join(timeout=10)
+
+
+# --- stop/restart hygiene ----------------------------------------------------
+
+
+def test_handshake_refuses_a_daemon_reporting_foreign_code_identity(tmp_path):
+    import json
+    import socket as socket_mod
+    import tempfile
+
+    sock_dir = Path(tempfile.mkdtemp(prefix="pa-fake-", dir="/tmp"))
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    server.bind(str(sock_dir / "fake.sock"))
+    server.listen(1)
+
+    def reply_with_foreign_identity() -> None:
+        conn, _ = server.accept()
+        with conn:
+            reader = conn.makefile("r")
+            writer = conn.makefile("w")
+            request = json.loads(reader.readline())
+            writer.write(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "data": {"app_version": "9.9.9", "code_id": "0" * 64},
+                    }
+                )
+                + "\n"
+            )
+            writer.flush()
+            reader.close()
+            writer.close()
+        server.close()
+
+    threading.Thread(target=reply_with_foreign_identity, daemon=True).start()
+    with pytest.raises(PriorartError) as err:
+        DaemonClient(sock_dir / "fake.sock", "any-profile")
+    assert err.value.code == DAEMON_MISMATCH
+    assert "different code identity" in err.value.message
+
+
+def test_stop_daemon_without_a_lock_reports_nothing_to_stop(tmp_path):
+    from priorart.coordinator import stop_daemon
+
+    assert stop_daemon(tmp_path / "d.sock") == "no live daemon: nothing to stop"
+
+
+def test_stop_daemon_ignores_a_lock_nobody_holds(tmp_path):
+
+    from priorart.coordinator import stop_daemon
+
+    (tmp_path / "d.lock").write_text("4194303")
+    assert stop_daemon(tmp_path / "d.sock") == "no live daemon: nothing to stop"
+
+
+def test_stop_daemon_reports_a_holder_without_a_parseable_pid(tmp_path):
+    import fcntl
+    import os
+
+    from priorart.coordinator import stop_daemon
+
+    (tmp_path / "d.lock").write_text("not-a-pid")
+    fd = os.open(tmp_path / "d.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        assert stop_daemon(tmp_path / "d.sock") == (
+            "the daemon holds its claim but recorded no pid; stop it manually"
+        )
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_stop_daemon_signals_the_holder_and_waits_for_the_drain(tmp_path, monkeypatch):
+    import os
+    import signal
+
+    import priorart.coordinator as coordinator_mod
+    from priorart.coordinator import stop_daemon
+
+    daemon = DaemonFixture(tmp_path)
+    daemon.thread.start()
+    assert daemon.ready.wait(timeout=10)
+
+    def fake_kill(pid, sig):
+        assert sig == signal.SIGTERM
+        daemon.stop.set()
+
+    monkeypatch.setattr(coordinator_mod.os, "kill", fake_kill)
+    try:
+        assert stop_daemon(daemon.socket) == f"stopped priorart daemon pid {os.getpid()}"
+        daemon.thread.join(timeout=10)
+    finally:
+        daemon.stop.set()
+        daemon.thread.join(timeout=10)
+
+
+def test_stop_daemon_reports_draining_when_the_holder_never_releases(tmp_path, monkeypatch):
+    import fcntl
+    import os
+
+    import priorart.coordinator as coordinator_mod
+    from priorart.coordinator import stop_daemon
+
+    (tmp_path / "d.lock").write_text("4194303")
+    fd = os.open(tmp_path / "d.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        monkeypatch.setattr(coordinator_mod.os, "kill", lambda pid, sig: None)
+        message = stop_daemon(tmp_path / "d.sock", timeout=0.3)
+        assert "is still draining" in message
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_restart_daemon_spawns_a_replacement_and_confirms_readiness(tmp_path, monkeypatch):
+    import priorart.coordinator as coordinator_mod
+    from priorart.coordinator import restart_daemon
+
+    daemon = DaemonFixture(tmp_path)
+    daemon.thread.start()
+    assert daemon.ready.wait(timeout=10)
+    replacement = DaemonFixture(tmp_path, socket=daemon.socket)
+    spawned = []
+
+    def fake_spawn(path, *, config_path=None):
+        spawned.append((path, config_path))
+        replacement.thread.start()
+        assert replacement.ready.wait(timeout=10)
+
+    def fake_kill(pid, sig):
+        daemon.stop.set()
+
+    monkeypatch.setattr(coordinator_mod, "spawn_daemon", fake_spawn)
+    monkeypatch.setattr(coordinator_mod.os, "kill", fake_kill)
+    try:
+        message = restart_daemon(daemon.config, daemon.socket)
+        assert "; restarted priorart daemon on " in message
+        assert spawned == [(daemon.socket, None)]
+        daemon.thread.join(timeout=10)
+    finally:
+        daemon.stop.set()
+        replacement.stop.set()
+        daemon.thread.join(timeout=10)
+        replacement.thread.join(timeout=10)
+
+
+def test_restart_daemon_raises_when_no_replacement_becomes_ready(tmp_path, monkeypatch):
+    import priorart.coordinator as coordinator_mod
+    from priorart.coordinator import restart_daemon
+
+    monkeypatch.setattr(coordinator_mod, "_HANDSHAKE_TIMEOUT", 0.3)
+    import tempfile
+
+    sock_dir = Path(tempfile.mkdtemp(prefix="pa-restart-", dir="/tmp"))
+    monkeypatch.setattr(coordinator_mod, "spawn_daemon", lambda path, *, config_path=None: None)
+    with pytest.raises(FileNotFoundError):
+        restart_daemon(make_config(tmp_path), sock_dir / "d.sock")
+
+
+@pytest.mark.parametrize(
+    "stopped",
+    [
+        "the daemon holds its claim but recorded no pid; stop it manually",
+        "priorart daemon pid 4242 is still draining after 60s; it releases the socket when done",
+    ],
+)
+def test_restart_daemon_refuses_to_spawn_beside_a_daemon_it_could_not_stop(
+    tmp_path, monkeypatch, stopped
+):
+    import priorart.coordinator as coordinator_mod
+    from priorart.coordinator import restart_daemon
+    from priorart.core.errors import DAEMON_STOP_FAILED
+
+    spawned = []
+
+    def fake_spawn(path, *, config_path=None):
+        spawned.append(path)
+
+    monkeypatch.setattr(coordinator_mod, "stop_daemon", lambda path, timeout=60.0: stopped)
+    monkeypatch.setattr(coordinator_mod, "spawn_daemon", fake_spawn)
+    with pytest.raises(PriorartError) as err:
+        restart_daemon(make_config(tmp_path), tmp_path / "d.sock")
+    assert err.value.code == DAEMON_STOP_FAILED
+    assert err.value.message == stopped
+    assert "priorart daemon restart again" in err.value.payload()["next_action"]
+    assert not spawned  # never spawn beside a daemon the stop could not replace
+
+
+def test_restart_daemon_reports_a_refusing_replacement_cleanly(tmp_path, monkeypatch):
+    import json
+    import socket as socket_mod
+    import tempfile
+
+    import priorart.coordinator as coordinator_mod
+    from priorart.coordinator import restart_daemon
+
+    sock_dir = Path(tempfile.mkdtemp(prefix="pa-refuse-", dir="/tmp"))
+    sock = sock_dir / "d.sock"
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    server.bind(str(sock))
+    server.listen(1)
+
+    def refuse_handshake() -> None:
+        conn, _ = server.accept()
+        with conn:
+            reader = conn.makefile("r")
+            writer = conn.makefile("w")
+            request = json.loads(reader.readline())
+            writer.write(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": False,
+                        "error": {"code": "DAEMON_MISMATCH", "message": "stale daemon"},
+                    }
+                )
+                + "\n"
+            )
+            writer.flush()
+            reader.close()
+            writer.close()
+        server.close()
+
+    threading.Thread(target=refuse_handshake, daemon=True).start()
+    monkeypatch.setattr(coordinator_mod, "spawn_daemon", lambda path, *, config_path=None: None)
+    with pytest.raises(PriorartError) as err:
+        restart_daemon(make_config(tmp_path), sock)
+    assert "refused the restarted client: stale daemon" in err.value.message
+    assert err.value.code == DAEMON_MISMATCH
+
+
+def test_stop_daemon_ignores_a_holder_that_exited_before_the_signal(tmp_path, monkeypatch):
+    import fcntl
+    import os
+
+    import priorart.coordinator as coordinator_mod
+    from priorart.coordinator import stop_daemon
+
+    (tmp_path / "d.lock").write_text("4242")
+    fd = os.open(tmp_path / "d.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        def exited_before_signal(pid, sig):
+            raise ProcessLookupError
+
+        monkeypatch.setattr(coordinator_mod.os, "kill", exited_before_signal)
+        assert stop_daemon(tmp_path / "d.sock") == "no live daemon: nothing to stop"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_stop_daemon_reports_a_holder_of_another_user(tmp_path, monkeypatch):
+    import fcntl
+    import os
+
+    import priorart.coordinator as coordinator_mod
+    from priorart.coordinator import stop_daemon
+
+    (tmp_path / "d.lock").write_text("4242")
+    fd = os.open(tmp_path / "d.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        def foreign_holder(pid, sig):
+            raise PermissionError
+
+        monkeypatch.setattr(coordinator_mod.os, "kill", foreign_holder)
+        assert stop_daemon(tmp_path / "d.sock") == (
+            "priorart daemon pid 4242 belongs to another user; stop it manually"
+        )
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_stop_daemon_reports_a_lock_of_another_user(tmp_path, monkeypatch):
+    import priorart.coordinator as coordinator_mod
+    from priorart.coordinator import stop_daemon
+
+    (tmp_path / "d.lock").write_text("4242")
+
+    def foreign_open(path, flags):
+        raise PermissionError
+
+    monkeypatch.setattr(coordinator_mod.os, "open", foreign_open)
+    assert stop_daemon(tmp_path / "d.sock") == (
+        "the daemon lock file belongs to another user; stop that daemon manually"
+    )

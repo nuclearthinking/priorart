@@ -12,8 +12,12 @@ Protocol: one JSON object per line, responses mirror the request id.
 Every op returns ``{"id": n, "ok": true, "data": ...}`` or
 ``{"id": n, "ok": false, "error": {code, message, ...details}}``; domain
 errors travel as ``PriorartError`` codes and are re-raised client-side.
-The handshake pins the protocol, application version and effective service
-profile: a mismatch is a hard refusal, never a best-effort mix.
+The handshake pins the protocol, the identity of the loaded code and the
+effective service profile: a mismatch is a hard refusal, never a
+best-effort mix. The reported app version is diagnostic echo for
+``priorart doctor`` and is never a gate: a version string can stay the
+same while the running code differs (an editable checkout changes on
+every edit), which is exactly what the code identity pins.
 
 Client side: one connection per admitted operation — concurrent callers
 never serialize behind a shared socket. A broken transport link replays
@@ -29,6 +33,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -40,14 +45,16 @@ from priorart.core import (
     APP_VERSION,
     DAEMON_MISMATCH,
     DAEMON_PROFILE_MISMATCH,
+    DAEMON_STOP_FAILED,
     HANDLE_CLOSED,
     Job,
     PriorartError,
+    code_identity,
 )
 from priorart.registry import RuntimeRegistry
 from priorart.retrieval import IndexSummary, SearchReport
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 DEFAULT_SOCKET = "~/.priorart/daemon.sock"
 _HANDSHAKE_TIMEOUT = 10.0
 
@@ -83,8 +90,9 @@ def _claim_singleton(socket_path: Path) -> int:
     An flock'd sidecar file is the single-instance truth: a socket probe
     alone races (a daemon between ``bind`` and ``listen`` looks dead), and
     unlinking its socket would orphan a live process holding writer locks.
-    Returns the lock fd: the claim holds exactly as long as the caller (the
-    serve loop) keeps it open.
+    The claim records the daemon pid for ``daemon stop``. Returns the lock
+    fd: the claim holds exactly as long as the caller (the serve loop)
+    keeps it open.
     """
     lock_path = socket_path.with_suffix(".lock")
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
@@ -93,6 +101,8 @@ def _claim_singleton(socket_path: Path) -> int:
     except OSError:
         os.close(lock_fd)
         raise SystemExit(f"another priorart daemon already listens on {socket_path}") from None
+    os.ftruncate(lock_fd, 0)
+    os.write(lock_fd, str(os.getpid()).encode())
     # the socket file itself is stale only if no live process holds the lock
     if socket_path.exists():
         try:
@@ -112,6 +122,7 @@ def serve(config, socket_path: Path, *, stop_event=None, ready_event=None) -> No
     lock_fd = _claim_singleton(path)
     registry = RuntimeRegistry(config)
     fingerprint = profile_fingerprint(config)
+    identity = code_identity()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
     listener.listen(8)
@@ -128,7 +139,7 @@ def serve(config, socket_path: Path, *, stop_event=None, ready_event=None) -> No
                 connections = [item for item in connections if item[1].is_alive()]
                 continue
             thread = threading.Thread(
-                target=_serve_connection, args=(conn, registry, fingerprint), daemon=True
+                target=_serve_connection, args=(conn, registry, fingerprint, identity), daemon=True
             )
             thread.start()
             connections.append((conn, thread))
@@ -152,7 +163,9 @@ def serve(config, socket_path: Path, *, stop_event=None, ready_event=None) -> No
         os.close(lock_fd)
 
 
-def _serve_connection(conn: socket.socket, registry: RuntimeRegistry, fingerprint: str) -> None:
+def _serve_connection(
+    conn: socket.socket, registry: RuntimeRegistry, fingerprint: str, code_id: str
+) -> None:
     with conn:
         reader = conn.makefile("r")
         writer = conn.makefile("w")
@@ -162,7 +175,7 @@ def _serve_connection(conn: socket.socket, registry: RuntimeRegistry, fingerprin
                 continue
             try:
                 request = json.loads(line)
-                response = _dispatch(registry, request, fingerprint)
+                response = _dispatch(registry, request, fingerprint, code_id)
             except PriorartError as err:
                 response = {
                     "id": _request_id(line),
@@ -187,24 +200,36 @@ def _request_id(line: str):
     return parsed.get("id") if isinstance(parsed, dict) else None
 
 
-def _dispatch(registry: RuntimeRegistry, request: dict, fingerprint: str) -> dict:
+def _dispatch(registry: RuntimeRegistry, request: dict, fingerprint: str, code_id: str) -> dict:
     op = request.get("op")
     request_id = request.get("id")
     if op == "handshake":
-        if request.get("protocol") != PROTOCOL_VERSION or request.get("app_version") != APP_VERSION:
+        if request.get("protocol") != PROTOCOL_VERSION:
             raise PriorartError(
                 DAEMON_MISMATCH,
-                "the priorart daemon speaks a different protocol or version; "
-                "restart it (priorart daemon)",
-                daemon_protocol=request.get("protocol"),
-                daemon_app_version=request.get("app_version"),
+                "the priorart daemon speaks a different protocol; "
+                "restart it (priorart daemon restart)",
+                daemon_protocol=PROTOCOL_VERSION,
+                daemon_app_version=APP_VERSION,
+            )
+        if request.get("code_id") != code_id:
+            raise PriorartError(
+                DAEMON_MISMATCH,
+                "the priorart daemon runs different priorart code; "
+                "restart it (priorart daemon restart)",
+                daemon_code_id=code_id,
+                daemon_app_version=APP_VERSION,
             )
         if request.get("profile") != fingerprint:
             raise PriorartError(
                 DAEMON_PROFILE_MISMATCH,
                 "the priorart daemon uses a different effective service configuration",
             )
-        return {"id": request_id, "ok": True, "data": {"app_version": APP_VERSION}}
+        return {
+            "id": request_id,
+            "ok": True,
+            "data": {"app_version": APP_VERSION, "code_id": code_id},
+        }
     payload = _OPS[op](registry, request) if op in _OPS else None
     if payload is None:
         raise PriorartError("DAEMON_UNKNOWN_OP", f"unknown daemon op {op!r}")
@@ -291,8 +316,9 @@ class _BrokenDaemonTransport(PriorartError):  # noqa: N818 - a transport signal,
     """The connection broke locally; the daemon-side outcome is unknown.
 
     Only local write/read/EOF/framing and response-id failures raise this
-    signal. Daemon-side refusals (protocol, app version, service profile)
-    stay plain ``PriorartError`` and are never replayed automatically.
+    signal. Daemon-side refusals (protocol, loaded code identity, effective
+    service profile) stay plain ``PriorartError`` and are never replayed
+    automatically.
     """
 
     def __init__(self, message: str) -> None:
@@ -323,14 +349,16 @@ class DaemonClient:
             raise
 
     def _handshake(self) -> None:
+        identity = code_identity()
         response = self.call(
             "handshake",
             protocol=PROTOCOL_VERSION,
             app_version=APP_VERSION,
+            code_id=identity,
             profile=self._profile,
         )
-        if response.get("app_version") != APP_VERSION:
-            raise PriorartError(DAEMON_MISMATCH, "daemon reported a different application version")
+        if response.get("code_id") != identity:
+            raise PriorartError(DAEMON_MISMATCH, "daemon reported a different code identity")
 
     def call(self, op: str, **args) -> dict:
         with self._mutex:
@@ -378,15 +406,9 @@ class DaemonClient:
             self._conn.close()
 
 
-def connect(config, *, autostart: bool = True, config_path: Path | None = None) -> DaemonClient:
-    """Connect to the configured daemon, starting one when allowed."""
-    path = Path(config.daemon_socket or DEFAULT_SOCKET).expanduser()
-    try:
-        return DaemonClient(path, profile_fingerprint(config))
-    except (FileNotFoundError, ConnectionRefusedError):
-        if not autostart:
-            raise
-    argv = [sys.executable, "-m", "priorart", "daemon", "--socket", str(path)]
+def spawn_daemon(socket_path: Path, *, config_path: Path | None = None) -> None:
+    """Start a detached coordinator daemon listening on ``socket_path``."""
+    argv = [sys.executable, "-m", "priorart", "daemon", "start", "--socket", str(socket_path)]
     if config_path is not None:
         argv.extend(("--config", str(Path(config_path).expanduser().resolve())))
     subprocess.Popen(  # noqa: S603 - fixed priorart argv
@@ -395,6 +417,118 @@ def connect(config, *, autostart: bool = True, config_path: Path | None = None) 
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def _signal_holder(lock_fd: int) -> tuple[int | None, str | None]:
+    """Signal the recorded holder pid; returns ``(pid, message)``.
+
+    ``pid`` is None when the claim's holder could not be signalled at all;
+    ``message`` is None when the SIGTERM was delivered and the caller should
+    wait for the drain.
+    """
+    try:
+        pid = int(os.pread(lock_fd, 32, 0).strip())
+    except ValueError:
+        return None, "the daemon holds its claim but recorded no pid; stop it manually"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        # the holder exited between the flock probe and the signal
+        return None, "no live daemon: nothing to stop"
+    except PermissionError:
+        return None, f"priorart daemon pid {pid} belongs to another user; stop it manually"
+    return pid, None
+
+
+def stop_daemon(socket_path: Path, *, timeout: float = 60.0) -> str:
+    """Stop the daemon on ``socket_path``; idempotent, never signals a stranger.
+
+    The flock'd sidecar is the single-instance truth: acquiring it proves
+    no live daemon holds the slot, whatever a stale pid file may record.
+    Only a live holder's recorded pid is signalled, with SIGTERM, so the
+    daemon drains in-flight work before releasing the socket.
+    """
+    lock_path = Path(socket_path).expanduser().with_suffix(".lock")
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR)
+    except FileNotFoundError:
+        return "no live daemon: nothing to stop"
+    except PermissionError:
+        return "the daemon lock file belongs to another user; stop that daemon manually"
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            pass  # a live daemon holds the claim
+        else:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            return "no live daemon: nothing to stop"
+        pid, refused = _signal_holder(lock_fd)
+        if refused is not None:
+            return refused
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                time.sleep(0.1)
+                continue
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            return f"stopped priorart daemon pid {pid}"
+        return (
+            f"priorart daemon pid {pid} is still draining after {timeout:.0f}s; "
+            "it releases the socket when done"
+        )
+    finally:
+        os.close(lock_fd)
+
+
+def restart_daemon(config, socket_path: Path, *, config_path: Path | None = None) -> str:
+    """Stop the daemon on ``socket_path`` and start a fresh detached one.
+
+    Refuses to spawn beside a daemon it could not stop: the replacement
+    would die on the singleton claim and the readiness probe would talk to
+    the surviving old daemon.
+    """
+    path = Path(socket_path).expanduser()
+    stopped = stop_daemon(path)
+    if stopped != "no live daemon: nothing to stop" and not stopped.startswith(
+        "stopped priorart daemon pid"
+    ):
+        raise PriorartError(DAEMON_STOP_FAILED, stopped)
+    spawn_daemon(path, config_path=config_path)
+    deadline = time.monotonic() + _HANDSHAKE_TIMEOUT
+    while True:
+        try:
+            client = DaemonClient(path, profile_fingerprint(config))
+        except (FileNotFoundError, ConnectionRefusedError, _BrokenDaemonTransport):
+            # a broken transport here is a fresh daemon dying mid-handshake
+            # (e.g. a concurrent stop): retry like a not-yet-started one
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.1)
+        except PriorartError as err:
+            # something answers on the socket but refuses this client —
+            # most likely a daemon the stop step could not replace
+            raise PriorartError(
+                err.code,
+                f"the daemon on {path} refused the restarted client: {err.message}",
+                **err.details,
+            ) from err
+        else:
+            client.close()
+            return f"{stopped}; restarted priorart daemon on {path}"
+
+
+def connect(config, *, autostart: bool = True, config_path: Path | None = None) -> DaemonClient:
+    """Connect to the configured daemon, starting one when allowed."""
+    path = Path(config.daemon_socket or DEFAULT_SOCKET).expanduser()
+    try:
+        return DaemonClient(path, profile_fingerprint(config))
+    except (FileNotFoundError, ConnectionRefusedError):
+        if not autostart:
+            raise
+    spawn_daemon(path, config_path=config_path)
     deadline = time.monotonic() + _HANDSHAKE_TIMEOUT
     while True:
         try:

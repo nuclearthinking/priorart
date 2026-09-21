@@ -162,8 +162,9 @@ job is still a successful job lookup; inspect `data.job.failure` for `code`,
 | `WRITER_BUSY` | Wait for the external writer to finish, then retry `refresh_index` |
 | `REFRESH_FAILED` | Read the failure message, correct the cause, and submit another refresh |
 | `JOB_INTERRUPTED` | The daemon restarted; keep a published lexical epoch if present and submit a refresh to finish |
-| `DAEMON_PROFILE_MISMATCH` | Stop the existing Priorart daemon using that socket, then reconnect; the MCP client starts one with the current config |
-| `DAEMON_MISMATCH` | Stop the older/incompatible Priorart daemon after an upgrade, then reconnect. If the message says the refresh outcome is unknown, the first refresh may have started: call `refresh_index` again to join or restart it |
+| `DAEMON_PROFILE_MISMATCH` | Stop the existing Priorart daemon using that socket (`priorart daemon stop`), then reconnect; the MCP client starts one with the current config |
+| `DAEMON_MISMATCH` | Run `priorart daemon restart`, then retry. If the daemon is already current, restart the MCP client session instead — its process may predate the last code change. If the message says the refresh outcome is unknown, the first refresh may have started: call `refresh_index` again to join or restart it |
+| `DAEMON_STOP_FAILED` | `priorart daemon restart` could not stop the holder (no recorded pid, still draining, or another user's process); wait for it to exit and retry, or stop the process manually first |
 
 Run diagnostics without printing secrets:
 
@@ -173,7 +174,38 @@ uv run --project /absolute/path/to/priorart priorart doctor \
 ```
 
 It reports the effective runtime mode, daemon socket, service-profile
-fingerprint, package versions, provider health, and selected index state.
+fingerprint, package versions, provider health, the daemon's reachability
+and code identity, and the selected index state.
+
+## Daemon restart hygiene
+
+The shared daemon outlives MCP client sessions, and the handshake pins the
+identity of the running code: after changing Priorart's own source (an
+editable checkout changes identity on every edit; an installed
+distribution only on upgrade), a daemon started from older code refuses
+every operation with a structured `DAEMON_MISMATCH` instead of answering
+with old payload shapes. Recovery is one command:
+
+```bash
+priorart daemon restart   # stop (graceful drain) + start a fresh detached daemon
+```
+
+- `priorart daemon start` runs the daemon in the foreground (what
+  autostart launches, detached).
+- `priorart daemon stop` is idempotent and never signals a process that
+  does not hold the daemon claim: the flock'd sidecar is the single
+  instance truth, a stale pid file alone is ignored.
+- `priorart daemon restart` never spawns beside a daemon it could not
+  stop: if the holder recorded no pid, is still draining, or belongs to
+  another user, it fails with a structured `DAEMON_STOP_FAILED` instead
+  of raising a replacement that would die on the singleton claim.
+- An in-flight refresh interrupted by a restart is reconciled honestly as
+  `JOB_INTERRUPTED` (journal-kept); a published lexical epoch keeps
+  serving searches.
+- `priorart doctor` reports whether the daemon on the configured socket is
+  reachable and current — it distinguishes "restart the daemon" from
+  "restart your MCP client session" (a client process predating the last
+  code change mismatches a fresh daemon the same way).
 
 ## Configuration
 

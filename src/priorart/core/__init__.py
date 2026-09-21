@@ -7,13 +7,14 @@ Modules outside this package import only the names re-exported here.
 
 from __future__ import annotations
 
-from .app import APP_VERSION
+from .app import APP_VERSION, code_identity, source_tree_digest
 from .config import Config
 from .contracts import Envelope
 from .errors import (
     AMBIGUOUS_WORKSPACE,
     DAEMON_MISMATCH,
     DAEMON_PROFILE_MISMATCH,
+    DAEMON_STOP_FAILED,
     HANDLE_CLOSED,
     INDEX_NOT_READY,
     INDEX_PROFILE_MISMATCH,
@@ -62,6 +63,7 @@ __all__ = [
     "APP_VERSION",
     "DAEMON_MISMATCH",
     "DAEMON_PROFILE_MISMATCH",
+    "DAEMON_STOP_FAILED",
     "FAILURE_JOB_INTERRUPTED",
     "FAILURE_REFRESH_FAILED",
     "FAILURE_WRITER_BUSY",
@@ -95,11 +97,13 @@ __all__ = [
     "SearchMode",
     "bounded_body",
     "canonical_root",
+    "code_identity",
     "git_ls_files",
     "git_output",
     "mode_covers",
     "new_job_id",
     "resolve_repo",
+    "source_tree_digest",
     "validate_map_request",
     "validate_search_request",
 ]

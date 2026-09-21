@@ -99,6 +99,7 @@ async def _stdio_flow(tmp_path: Path) -> None:
             "-m",
             "priorart",
             "daemon",
+            "start",
             "--socket",
             str(socket_path),
             "--config",

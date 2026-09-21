@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Annotated
@@ -21,6 +22,10 @@ from .registry import RuntimeRegistry
 from .retrieval import format_report
 
 app = typer.Typer(help="Local agentic code search: find existing symbols before writing new code.")
+daemon_app = typer.Typer(
+    help="Run, stop or restart the shared coordinator daemon.",
+)
+app.add_typer(daemon_app, name="daemon")
 
 _POLL_SECONDS = 0.05
 
@@ -168,6 +173,18 @@ def doctor(
     typer.echo(f"daemon_socket: {Path(settings.daemon_socket or DEFAULT_SOCKET).expanduser()}")
     typer.echo(f"service_profile: {profile_fingerprint(settings)[:12]}")
 
+    from .coordinator import connect as connect_daemon
+
+    try:
+        client = connect_daemon(settings, autostart=False)
+    except PriorartError as err:
+        typer.echo(f"daemon: reachable, but refused this client: {err.message}")
+    except OSError:
+        typer.echo("daemon: not reachable (priorart daemon restart starts one)")
+    else:
+        typer.echo("daemon: reachable, current")
+        client.close()
+
     configured = sorted(settings.model_fields_set)
     if configured:
         typer.echo(f"config set: {', '.join(configured)}")
@@ -186,8 +203,8 @@ def doctor(
         registry.close()
 
 
-@app.command()
-def daemon(
+@daemon_app.command("start")
+def daemon_start(
     socket_path: Annotated[
         Path | None,
         typer.Option("--socket", help="Unix socket to listen on."),
@@ -196,12 +213,14 @@ def daemon(
         Path | None, typer.Option("--config", help="Explicit service config file.")
     ] = None,
 ) -> None:
-    """Run the shared coordinator: jobs, watchers and caches in one process.
+    """Run the shared coordinator in the foreground until interrupted.
 
     MCP servers are thin front-ends of this process by default; background
     indexing survives client restarts. Correctness never depends on the
     daemon: stores, locks and atomic commits stay valid without it.
     """
+    import signal
+
     from .coordinator import DEFAULT_SOCKET
     from .coordinator import serve as serve_coordinator
 
@@ -209,8 +228,56 @@ def daemon(
     path = socket_path or Path(settings.daemon_socket or DEFAULT_SOCKET)
     if not str(path).strip():
         raise typer.BadParameter("the socket path must not be empty")
+    stop_event = threading.Event()
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: stop_event.set())
     typer.echo(f"priorart daemon listening on {path}")
-    serve_coordinator(settings, path)
+    serve_coordinator(settings, path, stop_event=stop_event)
+
+
+@daemon_app.command()
+def stop(
+    socket_path: Annotated[
+        Path | None,
+        typer.Option("--socket", help="Unix socket the daemon listens on."),
+    ] = None,
+    config: Annotated[
+        Path | None, typer.Option("--config", help="Explicit service config file.")
+    ] = None,
+) -> None:
+    """Stop the daemon gracefully: live calls drain, in-flight jobs interrupt."""
+    from .coordinator import DEFAULT_SOCKET, stop_daemon
+
+    settings = Config(_env_file=config) if config is not None else Config()
+    path = socket_path or Path(settings.daemon_socket or DEFAULT_SOCKET)
+    try:
+        typer.echo(stop_daemon(path))
+    except OSError as err:
+        typer.echo(f"could not stop the priorart daemon: {err}", err=True)
+        raise typer.Exit(code=1) from err
+
+
+@daemon_app.command()
+def restart(
+    socket_path: Annotated[
+        Path | None,
+        typer.Option("--socket", help="Unix socket the daemon listens on."),
+    ] = None,
+    config: Annotated[
+        Path | None, typer.Option("--config", help="Explicit service config file.")
+    ] = None,
+) -> None:
+    """Stop the daemon and start a fresh detached one on the same socket."""
+    from .coordinator import DEFAULT_SOCKET, restart_daemon
+
+    settings = Config(_env_file=config) if config is not None else Config()
+    path = socket_path or Path(settings.daemon_socket or DEFAULT_SOCKET)
+    try:
+        typer.echo(restart_daemon(settings, path, config_path=config))
+    except PriorartError as err:
+        _fail(err)
+    except OSError as err:
+        typer.echo(f"could not restart the priorart daemon: {err}", err=True)
+        raise typer.Exit(code=1) from err
 
 
 def _registry() -> RuntimeRegistry:

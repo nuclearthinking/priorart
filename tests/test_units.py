@@ -861,3 +861,37 @@ def test_foreign_database_zero_user_version_is_refused(tmp_path):
     assert raw.execute("PRAGMA user_version").fetchone()[0] == 0
     assert raw.execute("SELECT COUNT(*) FROM app_data").fetchone()[0] == 1
     raw.close()
+
+
+# --- code identity (daemon handshake pins the loaded code) ---------------------
+
+
+def test_source_tree_digest_tracks_edits_outside_core(tmp_path):
+    import shutil
+
+    import priorart
+    from priorart.core import source_tree_digest
+
+    package_root = Path(priorart.__file__).resolve().parent
+    first = tmp_path / "first" / "priorart"
+    second = tmp_path / "second" / "priorart"
+    shutil.copytree(package_root, first)
+    shutil.copytree(package_root, second)
+    assert source_tree_digest(first) == source_tree_digest(second)
+    # an edit outside core/ (the daemon protocol lives in coordinator.py)
+    # must change the identity: this is the incident class of a stale daemon
+    (second / "coordinator.py").write_text(
+        (second / "coordinator.py").read_text() + "\n# a local edit\n"
+    )
+    assert source_tree_digest(first) != source_tree_digest(second)
+    # stability: the same tree digests to the same value
+    assert source_tree_digest(first) == source_tree_digest(first)
+
+
+def test_code_identity_is_the_digest_of_the_live_package_tree():
+    import priorart
+    from priorart.core import code_identity, source_tree_digest
+
+    package_root = Path(priorart.__file__).resolve().parent
+    assert code_identity() == source_tree_digest(package_root)
+    assert code_identity() == code_identity()
